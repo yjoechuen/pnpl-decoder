@@ -2,7 +2,30 @@ import numpy as np
 import pytest
 import torch
 
-from decoder import TemporalCNN, balanced_metrics, grouped_split, normalize_windows, select_training_records, config, word_key
+from decoder import TemporalCNN, balanced_metrics, grouped_split, normalize_windows, select_training_records, config, word_key, seed_everything
+
+
+def test_seed_policy_warns_on_unsupported_deterministic_operations():
+    seed_everything(2026, threads=2)
+    first = torch.randn(4)
+    seed_everything(2026, threads=2)
+    torch.testing.assert_close(first, torch.randn(4))
+    assert torch.are_deterministic_algorithms_enabled()
+    assert torch.is_deterministic_algorithms_warn_only_enabled()
+    assert torch.backends.cudnn.deterministic
+    assert not torch.backends.cudnn.benchmark
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
+def test_cuda_training_backward():
+    seed_everything(2026, threads=2)
+    model = TemporalCNN(width=32).cuda()
+    optimizer = torch.optim.AdamW(model.parameters())
+    logits = model(torch.randn(3, 306, 250, device='cuda'))
+    loss = torch.nn.functional.cross_entropy(logits, torch.tensor([0, 1, 2], device='cuda'))
+    loss.backward()
+    optimizer.step()
+    assert torch.isfinite(loss)
 
 
 def test_shapes_and_gradients():

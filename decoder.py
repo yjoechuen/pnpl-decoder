@@ -87,13 +87,20 @@ def config(path: str | Path) -> dict[str, Any]:
 
 
 def seed_everything(seed: int, threads: int = 4) -> None:
+    """Seed RNGs; prefer deterministic kernels without blocking CUDA training.
+
+    Some CUDA operations (including adaptive pooling backward) lack a
+    deterministic implementation. Warn on those operations rather than crash;
+    GPU runs are therefore not guaranteed to be bitwise reproducible.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.set_num_threads(threads)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 

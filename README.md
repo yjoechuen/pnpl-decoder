@@ -29,6 +29,7 @@ pnpl-decoder submit
 ```
 
 For CUDA, install a CUDA PyTorch build instead of the CPU build; training/inference automatically selects CUDA when available. Use `--device cpu` to override.
+Fixed seeds and deterministic-kernel preferences are enabled. Unsupported deterministic CUDA operations (such as adaptive-pooling backward) emit warnings instead of stopping training. GPU runs are not guaranteed to be bitwise reproducible. The tests include a CUDA forward/backward/optimizer smoke test, skipped on CPU-only systems.
 The final command uploads to the requested competition and requires Kaggle authentication and accepted rules. Set `KAGGLE_API_TOKEN` securely in your shell/environment; **never commit credentials**. Check the competition's current deadline and submission allowance before uploading. This workspace initially has neither GPU nor Kaggle credentials.
 
 ## Evidence-based model, not a claimed winning solution
