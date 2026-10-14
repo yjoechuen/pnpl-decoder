@@ -101,6 +101,12 @@ Use `config_wide_cnn.json` to compare on existing data, then
 `config_wide_cnn_expanded.json` for extra Sherlock/Moth training sessions with
 the original validation groups frozen. Both reuse the baseline preprocessing.
 
+**Current objective: raw validation BAcc@10.** Checkpoints/early stopping use
+raw scores. Inference now defaults to raw; use CLI `--prior-corrected` or notebook
+`predict(prior_corrected=True)` only for an explicit correction experiment.
+The wider CNN reached a reported interim 32.96% raw score at epoch 13 versus
+27.42% for the GPU baseline. This is not a verified Kaggle improvement.
+
 **New GPU candidate:** [multi-scale CNN–Conformer experiment](CONFORMER_EXPERIMENT.md),
 configured in `config_conformer.json`. The original CNN remains the default so
 old checkpoints continue to load. The candidate reuses the baseline data/split;

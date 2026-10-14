@@ -83,8 +83,11 @@ and training are intentionally performed in your Kaggle notebook.
 
 ## Validation and submission
 
-Compare raw and corrected validation BAcc@10 against baseline 27.42%/31.24%,
-plus per-class recall. Use a new output directory and do not resume the
+Focus on **raw** validation BAcc@10 against baseline **27.42%**, plus per-class
+recall. The user-reported expanded wider-CNN run reached **32.96% at epoch 13**
+(+5.54 percentage points), with top-1 5.09% at that epoch. This is an interim
+local validation result, not a completed run or measured Kaggle gain.
+Use a new output directory and do not resume the
 Conformer or narrow CNN into this architecture. Only submit a promising model:
 
 ```python
@@ -95,3 +98,20 @@ The larger model and longer epoch budget are both changes; an expanded-data
 run additionally changes training volume. Keep the model-only run to understand
 which intervention helps. No drastic gain is promised. Preserve reports and
 weights before terminating the notebook session.
+
+Predictions now default to raw, ignoring stored prior correction unless
+`prior_corrected=True` is explicitly requested. Checkpoint selection and early
+stopping continue to use raw BAcc@10. Corrected reports remain optional diagnostics,
+not the current development objective.
+
+Future logs include unweighted validation CE (`val_loss`) and online training
+raw recall (`train_bacc10_online`). The latter is measured during optimization
+with augmentation/dropout and changing weights: it is not clean evaluation-mode
+training recall. `train_loss` remains class-weighted CE, so its absolute scale
+should not be compared directly with unweighted `val_loss`.
+
+The reported loss/validation divergence around epochs 10–12 is an overfitting
+warning, not proof; epoch 13 improved again. Finish the current run once, then
+repeat with independent training seeds (explicit validation groups stay fixed),
+compare dropout 0.3, and run the model on the smaller original dataset. Do not
+increase capacity or training length solely because training loss keeps falling.

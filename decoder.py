@@ -776,10 +776,17 @@ def train(args):
         started = time.monotonic()
         model.train()
         total, n = 0.0, 0
+        train_counts = np.zeros(N_CLASSES, dtype=np.int64)
+        train_hits = np.zeros(N_CLASSES, dtype=np.int64)
         for x, y in train_loader:
             x, y = augment(x.to(device)), y.to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss = criterion(model(x), y)
+            batch_logits = model(x)
+            loss = criterion(batch_logits, y)
+            with torch.no_grad():
+                correct = (batch_logits.topk(10, dim=1).indices == y[:, None]).any(dim=1)
+                train_counts += torch.bincount(y, minlength=N_CLASSES).cpu().numpy()
+                train_hits += torch.bincount(y[correct], minlength=N_CLASSES).cpu().numpy()
             if not torch.isfinite(loss):
                 raise ValueError("Nonfinite training loss")
             loss.backward()
@@ -790,7 +797,11 @@ def train(args):
         scheduler.step()
         logits, labels = evaluate(model, val_loader, device)
         top10, top1 = balanced_metrics(logits, labels), balanced_metrics(logits, labels, 1)
+        train_recall = np.divide(train_hits, train_counts, out=np.zeros(N_CLASSES), where=train_counts > 0)
+        # Standard unweighted CE: interpretable independently of class weighting.
+        val_loss = torch.nn.functional.cross_entropy(torch.from_numpy(logits), torch.from_numpy(labels)).item()
         row = {"epoch": epoch + 1, "train_loss": total/n, "val_bacc10": top10["bacc"],
+               "train_bacc10_online": float(train_recall.mean()), "val_loss": val_loss,
                "val_bacc1": top1["bacc"], "val_coverage": top10["coverage"], "seconds": time.monotonic()-started}
         history.append(row)
         print(json.dumps(row), flush=True)
@@ -836,6 +847,16 @@ def train(args):
     print(json.dumps(report), flush=True)
 
 
+def prediction_logits(logits, checkpoint, alpha=0.0):
+    """Raw logits by default; correction is an explicit inference opt-in."""
+    if alpha == 0:
+        return logits
+    counts = np.asarray(checkpoint["train_counts"], dtype=np.float64)
+    if counts.shape != (N_CLASSES,) or np.any(counts <= 0):
+        raise ValueError("Prior correction requires positive counts for all classes")
+    return logits - alpha * np.log(counts / counts.sum())
+
+
 def predict(args):
     """Run the trained model on the official deep holdout and write a CSV."""
     from pnpl.competition import LibriBrainCompetitionHoldout, load_vocabulary, write_submission
@@ -852,12 +873,12 @@ def predict(args):
     model.load_state_dict(checkpoint["state_dict"])
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model.to(device).eval()
-    log_prior = np.log(np.asarray(checkpoint["train_counts"])/sum(checkpoint["train_counts"]))
+    alpha = checkpoint.get("prior_alpha", 0.0) if getattr(args, "prior_corrected", False) else 0.0
     probabilities = []
     with torch.inference_mode():
         for meg, _ in holdout.iter_windows(batch_size=cfg["batch_size"]):
             logits = model(torch.from_numpy(normalize_windows(meg)).to(device)).cpu().numpy()
-            logits -= checkpoint.get("prior_alpha", 0.0) * log_prior
+            logits = prediction_logits(logits, checkpoint, alpha)
             probabilities.append(torch.from_numpy(logits).softmax(-1).numpy())
     scores = np.concatenate(probabilities)
     if scores.shape != (len(holdout.indices), N_CLASSES) or not np.isfinite(scores).all():
@@ -865,6 +886,8 @@ def predict(args):
     Path(args.csv).parent.mkdir(parents=True, exist_ok=True)
     write_submission(args.csv, indices=holdout.indices, primary_probs=scores)
     save_json(Path(args.csv).with_suffix(".json"), {"rows": len(scores), "counts": holdout.counts(),
+              "prediction_mode": "prior_corrected" if getattr(args, "prior_corrected", False) else "raw",
+              "prior_alpha": alpha,
               "checkpoint_sha256": hashlib.sha256(Path(args.checkpoint).read_bytes()).hexdigest(),
               "submission_sha256": hashlib.sha256(Path(args.csv).read_bytes()).hexdigest(),
               "competition": COMPETITION, "holdout_revision": cfg["revisions"]["pnpl/LibriBrain-Competition-2026"]})
@@ -908,6 +931,7 @@ def build_parser():
     p.set_defaults(fn=train)
     p = sub.add_parser("predict")
     p.add_argument("--checkpoint")
+    p.add_argument("--prior-corrected", action="store_true", help="Opt into checkpoint prior correction; default predictions are raw")
     p.add_argument("--data")
     p.add_argument("--csv")
     p.add_argument("--device", choices=["cpu", "cuda"])

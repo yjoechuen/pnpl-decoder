@@ -4,13 +4,14 @@ Develop and commit code in this repository, then train it in a Kaggle Notebook.
 This guide trains the **wider residual CNN** from `config_wide_cnn_expanded.json`,
 with extra Sherlock and Moth training sessions and unchanged validation sessions.
 Load `main` to get the new model; record the resolved commit SHA for each run.
-The larger model is a candidate, not a proven score improvement.
+The development objective is **raw validation BAcc@10**. Predictions are raw
+by default; prior correction is not part of the current comparison.
 
 ## Verification status
 
 The new model passed CPU forward/backward, optimizer-update, checkpoint
 round-trip, and baseline-split compatibility tests. The test suite had
-**51 passing tests and five GPU-dependent tests skipped** in the CPU workspace.
+**53 passing tests and five GPU-dependent tests skipped** in the CPU workspace.
 The expanded raw training subset is approximately **11.05 GiB**, excluding
 download scratch space and metadata.
 
@@ -174,9 +175,10 @@ single_gpu.train(devices=1)
 
 There is no need to prepare the same data again.
 
-Inspect `wide-cnn-expanded-001/validation_report.json` before submission. Compare against
-the GPU baseline's raw BAcc@10 **27.42%** and corrected **31.24%** on the same
-split. Validation also selects checkpoints/prior correction, so it is not an
+Inspect `wide-cnn-expanded-001/validation_report.json` before submission. Compare
+`raw_top10.bacc` against the GPU baseline's raw BAcc@10 **27.42%** on the same
+split. The reported wider-CNN run reached **32.96% at epoch 13**, an interim
+local result, not a Kaggle score. Validation selects checkpoints, so it is not an
 independent test estimate. See [WIDE_CNN_EXPERIMENT.md](WIDE_CNN_EXPERIMENT.md)
 for architecture, caveats, and next experiments.
 
@@ -188,6 +190,9 @@ print(submission)
 ```
 
 This writes `/kaggle/working/submission_wide_cnn.csv`.
+The default is **raw predictions**, even if the checkpoint stores `prior_alpha`.
+An explicit `run.predict(prior_corrected=True)` opt-in is retained for future
+experiments but is not used in this guide. The CSV sidecar records prediction mode.
 Expected output: **960 rows, 50 primary scores**.
 
 Download the CSV from notebook outputs and upload it through the competition's

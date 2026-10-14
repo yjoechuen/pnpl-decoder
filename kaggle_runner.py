@@ -56,7 +56,10 @@ class KaggleExperiment:
             args += ["--resume"]
         self._run("train", *args)
 
-    def predict(self, csv="/kaggle/working/submission_deep.csv"):
-        self._run("predict", "--checkpoint", self.output / "best.pt",
-                  "--data", self.data / "holdout", "--csv", csv, "--device", "cuda")
+    def predict(self, csv="/kaggle/working/submission_deep.csv", prior_corrected=False):
+        args = ["--checkpoint", self.output / "best.pt",
+                "--data", self.data / "holdout", "--csv", csv, "--device", "cuda"]
+        if prior_corrected:
+            args += ["--prior-corrected"]
+        self._run("predict", *args)
         return Path(csv)
