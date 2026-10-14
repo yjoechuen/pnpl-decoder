@@ -1,0 +1,18 @@
+{
+  "seed": 2026,
+  "tasks": {"Sherlock1": 10, "TheMoth": 6},
+  "val_fraction": 0.2,
+  "width": 48,
+  "dropout": 0.2,
+  "epochs": 12,
+  "batch_size": 128,
+  "learning_rate": 0.001,
+  "weight_decay": 0.01,
+  "patience": 5,
+  "threads": 4,
+  "revisions": {
+    "pnpl/LibriBrain": "5a7c332b34fc7be329c4df3e527a41f67bfd878f",
+    "pnpl/LibriBrain2": "78443d024480c66bf340073c69bef50af8d1d335",
+    "pnpl/LibriBrain-Competition-2026": "f72817721fb8d36a39840170d8ac644118fe45cc"
+  }
+}

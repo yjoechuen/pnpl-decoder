@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+data/
+artifacts/
+.env
+kaggle.json
+*.pth
+*.pt
+submission*.csv
