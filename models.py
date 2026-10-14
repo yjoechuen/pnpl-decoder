@@ -5,6 +5,53 @@ import torch
 from torch import nn
 
 
+class WideResidualBlock(nn.Module):
+    """Expanded pointwise mixing and local dilated convolution, without attention."""
+
+    def __init__(self, width, dilation, dropout):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.GroupNorm(8, width),
+            nn.Conv1d(width, 2 * width, 1), nn.GELU(),
+            nn.Conv1d(2 * width, 2 * width, 7, padding=3 * dilation,
+                      dilation=dilation, groups=2 * width),
+            nn.GroupNorm(8, 2 * width), nn.GELU(),
+            nn.Conv1d(2 * width, width, 1), nn.Dropout(dropout))
+
+    def forward(self, x):
+        return x + 0.5 * self.net(x)
+
+
+class WideResidualCNN(nn.Module):
+    """Wider baseline-like sensor/temporal CNN retaining onset-relative latency.
+
+    Independent single-trial inference. No attention, cross-trial pooling,
+    pretrained features, or adaptive-pooling CUDA backward required.
+    """
+
+    def __init__(self, width=128, dropout=0.2, dilations=(1, 2, 4, 8, 1, 2), pooling_bins=8):
+        super().__init__()
+        if width < 8 or width % 8:
+            raise ValueError("width must be a positive multiple of 8")
+        if not dilations or any(not isinstance(d, int) or d < 1 for d in dilations):
+            raise ValueError("dilations must be positive integers")
+        if not isinstance(pooling_bins, int) or not 1 <= pooling_bins <= 125:
+            raise ValueError("pooling_bins must be between 1 and 125")
+        self.pooling_bins = pooling_bins
+        self.encoder = nn.Sequential(
+            nn.Conv1d(306, width, 1), nn.GroupNorm(8, width), nn.GELU(), nn.AvgPool1d(2),
+            *(WideResidualBlock(width, d, dropout) for d in dilations),
+            nn.GroupNorm(8, width), nn.GELU())
+        self.head = nn.Sequential(nn.Flatten(), nn.Dropout(dropout), nn.Linear(width * pooling_bins, 50))
+
+    def forward(self, x):
+        if x.ndim != 3 or x.shape[1:] != (306, 250):
+            raise ValueError("Expected batch x 306 channels x 250 samples")
+        x = self.encoder(x)
+        pooled = torch.stack([part.mean(dim=-1) for part in torch.tensor_split(x, self.pooling_bins, dim=-1)], dim=-1)
+        return self.head(pooled)
+
+
 class FeedForward(nn.Module):
     def __init__(self, width, dropout):
         super().__init__()

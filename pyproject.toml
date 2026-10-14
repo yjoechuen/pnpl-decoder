@@ -19,7 +19,7 @@ pnpl-decoder = "decoder:main"
 py-modules = ["decoder", "final_test", "models", "kaggle_runner"]
 
 [tool.setuptools.data-files]
-"share/pnpl-decoder" = ["config.json", "config_conformer.json", "final_test.json"]
+"share/pnpl-decoder" = ["config.json", "config_conformer.json", "config_wide_cnn.json", "config_wide_cnn_expanded.json", "final_test.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -199,6 +199,18 @@ def select_training_records(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     from pnpl.datasets.libribrain100.constants import REPO_KEY_TO_ID
     for r in result:
         r["repo"] = REPO_KEY_TO_ID[r["repo"]]
+    if "validation_groups" in cfg:
+        requested = cfg["validation_groups"]
+        if not requested or any(len(g) != 3 for g in requested):
+            raise ValueError("validation_groups must contain (task, subject, session) triples")
+        groups = {tuple(str(value) for value in g) for g in requested}
+        available = {(r['task'], r['subject'], r['session']) for r in result}
+        if not groups.issubset(available):
+            raise ValueError(f"Validation groups absent from selected official train records: {groups - available}")
+        if groups == available:
+            raise ValueError("Fixed validation groups leave no training sessions")
+        return [{**r, "split": "val" if (r['task'], r['subject'], r['session']) in groups else "train"}
+                for r in result]
     return grouped_split(result, cfg["val_fraction"], cfg["seed"])
 
 
@@ -323,6 +335,8 @@ def verify_prepared_config(data_dir: Path, cfg: dict[str, Any]) -> dict[str, Any
     for key in ["tasks", "val_fraction", "seed", "revisions"]:
         if cfg[key] != prepared[key]:
             raise ValueError(f"Training config differs from preparation: {key}")
+    if select_training_records(cfg) != select_training_records(prepared):
+        raise ValueError("Training validation groups differ from prepared split")
     return prepared
 
 
@@ -360,6 +374,11 @@ def build_model(cfg: dict[str, Any]) -> nn.Module:
                                    layers=cfg.get("conformer_layers", 4),
                                    heads=cfg.get("attention_heads", 4),
                                    kernel_size=cfg.get("conformer_kernel", 15))
+    if name == "wide_residual_cnn":
+        from models import WideResidualCNN
+        return WideResidualCNN(cfg["width"], cfg["dropout"],
+                               dilations=cfg.get("cnn_dilations", [1, 2, 4, 8, 1, 2]),
+                               pooling_bins=cfg.get("pooling_bins", 8))
     raise ValueError(f"Unknown model: {name}")
 
 

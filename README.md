@@ -16,8 +16,8 @@ It is **not** trying to be a general-purpose framework yet.
 
 ## Kaggle setup and daily workflow
 
-For the new model, follow [KAGGLE_QUICKSTART.md](KAGGLE_QUICKSTART.md): it prepares
-the shared baseline data and trains `config_conformer.json` in a separate output
+For the latest model, follow [KAGGLE_QUICKSTART.md](KAGGLE_QUICKSTART.md): it prepares
+expanded training data and trains `config_wide_cnn_expanded.json` in a separate output
 directory. The short workflow below remains the original CNN baseline.
 
 Create a Kaggle Notebook, select **Settings → Accelerator → GPU T4 x2**, and enable **Internet**. Account verification and available quota may be required. Keep Kaggle's preinstalled CUDA-enabled PyTorch: **do not install a CPU-only torch build**.
@@ -95,6 +95,11 @@ Fixed seeds and deterministic-kernel preferences are enabled. Unsupported determ
 The final command uploads to the requested competition and requires Kaggle authentication and accepted rules. Set `KAGGLE_API_TOKEN` securely in your shell/environment; **never commit credentials**. Check the competition's current deadline and submission allowance before uploading. This workspace initially has neither GPU nor Kaggle credentials.
 
 ## Evidence-based model, not a claimed winning solution
+
+**Current candidate:** [wider residual CNN and data expansion](WIDE_CNN_EXPERIMENT.md).
+Use `config_wide_cnn.json` to compare on existing data, then
+`config_wide_cnn_expanded.json` for extra Sherlock/Moth training sessions with
+the original validation groups frozen. Both reuse the baseline preprocessing.
 
 **New GPU candidate:** [multi-scale CNN–Conformer experiment](CONFORMER_EXPERIMENT.md),
 configured in `config_conformer.json`. The original CNN remains the default so

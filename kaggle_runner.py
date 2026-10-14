@@ -35,10 +35,16 @@ class KaggleExperiment:
     def _run(self, command, *args):
         subprocess.run([sys.executable, str(self.repo / "decoder.py"), command, *map(str, args)], check=True)
 
-    def prepare(self, index_only=True):
+    def prepare(self, index_only=True, raw=None, preflight=False, disk_budget_gib=None):
         args = ["--config", self.config, "--data", self.data]
         if index_only:
             args += ["--index-only"]
+        if raw is not None:
+            args += ["--raw", raw]
+        if preflight:
+            args += ["--preflight"]
+        if disk_budget_gib is not None:
+            args += ["--disk-budget-gib", disk_budget_gib]
         self._run("prepare", *args)
 
     def train(self, devices=2, epochs=None, resume=False):

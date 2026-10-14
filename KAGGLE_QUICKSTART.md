@@ -1,7 +1,8 @@
 # Kaggle free-GPU training: step by step
 
 Develop and commit code in this repository, then train it in a Kaggle Notebook.
-This guide trains the new **multi-scale CNN–Conformer** from `config_conformer.json`.
+This guide trains the **wider residual CNN** from `config_wide_cnn_expanded.json`,
+with extra Sherlock and Moth training sessions and unchanged validation sessions.
 Load `main` to get the new model; record the resolved commit SHA for each run.
 The larger model is a candidate, not a proven score improvement.
 
@@ -9,8 +10,8 @@ The larger model is a candidate, not a proven score improvement.
 
 The new model passed CPU forward/backward, optimizer-update, checkpoint
 round-trip, and baseline-split compatibility tests. The test suite had
-**47 passing tests and four GPU-dependent tests skipped** in the CPU workspace.
-The configured raw training subset was approximately **4.92 GiB**, excluding
+**51 passing tests and five GPU-dependent tests skipped** in the CPU workspace.
+The expanded raw training subset is approximately **11.05 GiB**, excluding
 download scratch space and metadata.
 
 Single-GPU training was previously verified on Kaggle. The newer two-GPU path
@@ -87,8 +88,9 @@ print(f"Free disk: {free_gib:.1f} GiB")
 subprocess.run(
     [
         sys.executable, str(repo / "decoder.py"), "prepare",
-        "--config", str(repo / "config.json"),
-        "--data", "/kaggle/working/pnpl-data",
+        "--config", str(repo / "config_wide_cnn_expanded.json"),
+        "--data", "/kaggle/working/pnpl-expanded",
+        "--raw", "/kaggle/working/pnpl-data/raw",
         "--index-only",
         "--preflight",
     ],
@@ -102,10 +104,11 @@ This checks file sizes and disk headroom without downloading training files.
 
 ```python
 data_run = KaggleExperiment(
-    data="/kaggle/working/pnpl-data",
+    config="/kaggle/working/pnpl-decoder/config_wide_cnn_expanded.json",
+    data="/kaggle/working/pnpl-expanded",
 )
 
-data_run.prepare()
+data_run.prepare(raw="/kaggle/working/pnpl-data/raw", disk_budget_gib=16)
 ```
 
 The default uses **HDF5 indexing**, avoiding duplicated epoch arrays.
@@ -115,10 +118,11 @@ Expected outputs include `samples_h5.csv`, `vocabulary.json`,
 An unauthenticated Hugging Face warning is normally harmless for these public
 files. Optional authentication belongs in Kaggle Secrets, not notebook source.
 
-Preparation intentionally uses the original `config.json`: the Conformer uses
-identical data selections and splits, so that cache can be reused. If the cache
-is already prepared, skip this step. Do not prepare the existing cache using
-`config_conformer.json`; preparation rejects full-config changes.
+The expanded index gets a new directory, but shares the old raw downloads.
+With the original subset present, only about **6.14 GiB** extra is downloaded.
+Do not overwrite the old prepared cache with a different configuration.
+For a model-only comparison on existing data, use `config_wide_cnn.json` with
+`/kaggle/working/pnpl-data` and skip preparation.
 
 ## 6. Verify two-GPU forward/backward execution
 
@@ -126,7 +130,7 @@ is already prepared, skip this step. Do not prepare the existing cache using
 subprocess.run(
     [
         sys.executable, "-m", "pytest", "-q",
-        "tests/test_models.py::test_conformer_cuda_training",
+        "tests/test_wide_cnn.py::test_wide_cnn_cuda",
     ],
     cwd=repo,
     check=True,
@@ -136,7 +140,7 @@ subprocess.run(
 If pytest is missing, install it with
 `subprocess.run([sys.executable, "-m", "pip", "install", "pytest"], check=True)`.
 
-The parametrized test covers one and two GPUs and should pass on T4 x2. An unsupported-determinism **warning** is
+The test uses up to two available GPUs and should pass on T4 x2. An unsupported-determinism **warning** is
 expected; a traceback or nonzero exit is not. GPU runs are not guaranteed to
 be bitwise reproducible.
 
@@ -144,16 +148,16 @@ be bitwise reproducible.
 
 ```python
 run = KaggleExperiment(
-    config="/kaggle/working/pnpl-decoder/config_conformer.json",
-    data="/kaggle/working/pnpl-data",
-    output="/kaggle/working/conformer-001",
+    config="/kaggle/working/pnpl-decoder/config_wide_cnn_expanded.json",
+    data="/kaggle/working/pnpl-expanded",
+    output="/kaggle/working/wide-cnn-expanded-001",
 )
 run.train(devices=2)
 ```
 
-This runs up to **30 epochs**, with early stopping after eight epochs without
+This runs up to **24 epochs**, with early stopping after six epochs without
 raw validation BAcc@10 improvement. Checkpoints go to
-`/kaggle/working/conformer-001/`. Never resume the CNN checkpoint into this model.
+`/kaggle/working/wide-cnn-expanded-001/`. Never resume another architecture's checkpoint into this model.
 
 The configured batch size is global across GPUs. GPU memory is **not pooled**.
 DataParallel overhead or HDF5 reads may make this compact model slower on two
@@ -161,29 +165,29 @@ GPUs than on one. Compare in a separate output directory:
 
 ```python
 single_gpu = KaggleExperiment(
-    config="/kaggle/working/pnpl-decoder/config_conformer.json",
-    data="/kaggle/working/pnpl-data",
-    output="/kaggle/working/conformer-single-t4",
+    config="/kaggle/working/pnpl-decoder/config_wide_cnn_expanded.json",
+    data="/kaggle/working/pnpl-expanded",
+    output="/kaggle/working/wide-cnn-expanded-single-t4",
 )
 single_gpu.train(devices=1)
 ```
 
 There is no need to prepare the same data again.
 
-Inspect `conformer-001/validation_report.json` before submission. Compare against
+Inspect `wide-cnn-expanded-001/validation_report.json` before submission. Compare against
 the GPU baseline's raw BAcc@10 **27.42%** and corrected **31.24%** on the same
 split. Validation also selects checkpoints/prior correction, so it is not an
-independent test estimate. See [CONFORMER_EXPERIMENT.md](CONFORMER_EXPERIMENT.md)
+independent test estimate. See [WIDE_CNN_EXPERIMENT.md](WIDE_CNN_EXPERIMENT.md)
 for architecture, caveats, and next experiments.
 
 ## 8. Generate the submission after training
 
 ```python
-submission = run.predict(csv="/kaggle/working/submission_conformer.csv")
+submission = run.predict(csv="/kaggle/working/submission_wide_cnn.csv")
 print(submission)
 ```
 
-This writes `/kaggle/working/submission_conformer.csv`.
+This writes `/kaggle/working/submission_wide_cnn.csv`.
 Expected output: **960 rows, 50 primary scores**.
 
 Download the CSV from notebook outputs and upload it through the competition's
