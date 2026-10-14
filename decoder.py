@@ -1,7 +1,16 @@
-"""Prepare, train, predict and submit a single-trial Deep-track MEG baseline."""
+"""Prepare, train, predict and submit a single-trial Deep-track MEG baseline.
+
+The repository is intentionally centered on one strong, auditable baseline.
+Future model work should mainly touch:
+
+1. :func:`build_model` for new architectures,
+2. :func:`augment` for training-time augmentation,
+3. :func:`select_training_records` for larger training subsets.
+"""
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import importlib.metadata
 import json
@@ -10,6 +19,7 @@ from pathlib import Path
 import random
 import subprocess
 import time
+from typing import Any
 import unicodedata
 
 import h5py
@@ -23,19 +33,60 @@ from torch.utils.data import DataLoader, Dataset
 ROOT = Path(__file__).resolve().parent
 COMPETITION = "pnpl-competition-2026-deep"
 PROC = "bads+headpos+sss+notch+bp+ds"
+N_CHANNELS = 306
+WINDOW_SAMPLES = 250
+N_CLASSES = 50
+PRIOR_ALPHA_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 
 
-def save_json(path, value):
+@dataclass(frozen=True)
+class ArtifactPaths:
+    root: Path
+
+    @property
+    def best_checkpoint(self) -> Path:
+        return self.root / "best.pt"
+
+    @property
+    def latest_checkpoint(self) -> Path:
+        return self.root / "latest.pt"
+
+    @property
+    def history(self) -> Path:
+        return self.root / "history.json"
+
+    @property
+    def run_config(self) -> Path:
+        return self.root / "run_config.json"
+
+    @property
+    def validation_predictions(self) -> Path:
+        return self.root / "validation_predictions.npz"
+
+    @property
+    def validation_rows(self) -> Path:
+        return self.root / "validation_rows.csv"
+
+    @property
+    def validation_report(self) -> Path:
+        return self.root / "validation_report.json"
+
+    @property
+    def resume_note(self) -> Path:
+        return self.root / "resume_note.json"
+
+
+def save_json(path: str | Path, value: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
 
 
-def config(path):
+def config(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text())
 
 
-def seed_everything(seed, threads=4):
+def seed_everything(seed: int, threads: int = 4) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -46,12 +97,12 @@ def seed_everything(seed, threads=4):
     torch.backends.cudnn.benchmark = False
 
 
-def word_key(word):
+def word_key(word: str) -> str:
     # Standardize typography, not lexical identity: do not strip internal apostrophes.
     return unicodedata.normalize("NFKC", str(word)).strip().lower().replace("’", "'").replace("‘", "'")
 
 
-def normalize_windows(x):
+def normalize_windows(x: np.ndarray) -> np.ndarray:
     """Independent channel/window z-score, valid even when MEG is in tesla."""
     x = np.asarray(x, dtype=np.float32)
     if not np.isfinite(x).all():
@@ -61,7 +112,7 @@ def normalize_windows(x):
     return np.clip((x - mean) / np.maximum(std, np.float32(1e-30)), -10, 10).astype(np.float32)
 
 
-def grouped_split(records, fraction, seed):
+def grouped_split(records: list[dict[str, Any]], fraction: float, seed: int) -> list[dict[str, Any]]:
     """Split whole (task, subject, session) groups within each corpus."""
     if not 0 < fraction < 1:
         raise ValueError("val_fraction must be between zero and one")
@@ -84,7 +135,8 @@ def grouped_split(records, fraction, seed):
     return result
 
 
-def select_training_records(cfg):
+def select_training_records(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Choose official subject-0 train runs and add leakage-safe split labels."""
     from dataclasses import asdict
     from pnpl.datasets.libribrain100.manifest import select_records
     from pnpl.datasets.libribrain100.constants import CORPORA
@@ -102,29 +154,84 @@ def select_training_records(cfg):
     return grouped_split(result, cfg["val_fraction"], cfg["seed"])
 
 
-def download(repo, name, cfg, directory):
+def download(repo: str, name: str, cfg: dict[str, Any], directory: str | Path) -> Path:
     return Path(hf_hub_download(repo_id=repo, repo_type="dataset", filename=name,
                               revision=cfg["revisions"][repo], local_dir=directory))
 
 
-def prepare(args):
+def run_stem(record: dict[str, Any]) -> str:
+    return f"sub-{record['subject']}_ses-{record['session']}_task-{record['task']}_run-{record['run']}"
+
+
+def competition_vocabulary() -> list[str]:
     from pnpl.competition import load_vocabulary
+    return list(load_vocabulary("primary"))
+
+
+def competition_vocabulary_mapping() -> tuple[list[str], dict[str, int]]:
+    vocab = competition_vocabulary()
+    mapping = {word_key(word): i for i, word in enumerate(vocab)}
+    if len(vocab) != N_CLASSES or len(mapping) != N_CLASSES:
+        raise ValueError("Unexpected competition vocabulary")
+    return vocab, mapping
+
+
+def verify_prepared_config(data_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    prepared = config(data_dir / "prepared_config.json")
+    for key in ["tasks", "val_fraction", "seed", "revisions"]:
+        if cfg[key] != prepared[key]:
+            raise ValueError(f"Training config differs from preparation: {key}")
+    return prepared
+
+
+def split_sample_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train_rows = frame[frame.split.eq("train")]
+    val_rows = frame[frame.split.eq("val")]
+    for rows in [train_rows, val_rows]:
+        if not len(rows):
+            raise ValueError("Empty train/validation split")
+    train_groups = set(zip(train_rows.task, train_rows.subject, train_rows.session))
+    val_groups = set(zip(val_rows.task, val_rows.subject, val_rows.session))
+    assert not train_groups.intersection(val_groups)
+    return train_rows, val_rows
+
+
+def class_counts(labels: pd.Series | np.ndarray) -> np.ndarray:
+    counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=N_CLASSES)
+    if len(counts) != N_CLASSES:
+        raise ValueError("Unexpected label dimension")
+    return counts
+
+
+def build_model(cfg: dict[str, Any]) -> nn.Module:
+    """Single extension point for swapping in future model architectures."""
+    return TemporalCNN(cfg["width"], cfg["dropout"])
+
+
+def choose_prior_alpha(logits: np.ndarray, labels: np.ndarray, log_prior: np.ndarray) -> tuple[float, list[dict[str, float]]]:
+    trials = [
+        {"alpha": alpha, "bacc10": balanced_metrics(logits - alpha * log_prior, labels)["bacc"]}
+        for alpha in PRIOR_ALPHA_GRID
+    ]
+    return max(trials, key=lambda trial: trial["bacc10"])["alpha"], trials
+
+
+def prepare(args):
+    """Download selected official train runs and cache normalized 1-second epochs."""
     cfg = config(args.config)
     out = Path(args.data)
     out.mkdir(parents=True, exist_ok=True)
     # The preparation config is immutable unless the user removes/rebuilds the cache.
     if (out / "prepared_config.json").exists() and config(out / "prepared_config.json") != cfg:
         raise ValueError("Config differs from prepared cache; use a new --data directory")
-    vocab = list(load_vocabulary("primary"))
-    mapping = {word_key(w): i for i, w in enumerate(vocab)}
-    assert len(mapping) == 50
+    vocab, mapping = competition_vocabulary_mapping()
     records = select_training_records(cfg)
     save_json(out / "prepared_config.json", cfg)
     save_json(out / "vocabulary.json", vocab)
     save_json(out / "split_manifest.json", records)
     all_rows, summaries = [], []
     for number, r in enumerate(records):
-        stem = f"sub-{r['subject']}_ses-{r['session']}_task-{r['task']}_run-{r['run']}"
+        stem = run_stem(r)
         name = f"{r['task']}/derivatives/events/{stem}_events.tsv"
         events = download(r["repo"], name, cfg, out / "raw")
         df = pd.read_csv(events, sep="\t")
@@ -141,24 +248,24 @@ def prepare(args):
         rows, dropped = [], 0
         with h5py.File(path, "r") as f:
             sfreq = float(f.attrs["sample_frequency"])
-            if sfreq != 250 or f["data"].shape[0] != 306:
+            if sfreq != 250 or f["data"].shape[0] != N_CHANNELS:
                 raise ValueError(f"Unexpected H5 format for {stem}")
             for event_idx, row in words.iterrows():
                 onset = float(row.timemeg)
                 start = int(onset * sfreq)
-                if not np.isfinite(onset) or start < 0 or start + 250 > f["data"].shape[1]:
+                if not np.isfinite(onset) or start < 0 or start + WINDOW_SAMPLES > f["data"].shape[1]:
                     dropped += 1
                     continue
                 rows.append({"file": str(epoch_path.resolve()), "epoch": len(rows), "label": int(row.label),
                              "word": vocab[int(row.label)], "onset": onset, "event_index": int(event_idx),
                              **r})
-            expected = (len(rows), 306, 250)
+            expected = (len(rows), N_CHANNELS, WINDOW_SAMPLES)
             if not epoch_path.exists() or np.load(epoch_path, mmap_mode="r").shape != expected:
                 tmp = epoch_path.with_suffix(".tmp.npy")
                 epochs = np.lib.format.open_memmap(tmp, mode="w+", dtype="float32", shape=expected)
                 for row in rows:
                     start = int(row["onset"] * sfreq)
-                    epochs[row["epoch"]] = normalize_windows(f["data"][:, start:start + 250])
+                    epochs[row["epoch"]] = normalize_windows(f["data"][:, start:start + WINDOW_SAMPLES])
                 epochs.flush()
                 del epochs
                 tmp.replace(epoch_path)
@@ -168,7 +275,7 @@ def prepare(args):
         print(f"Prepared {number + 1}/{len(records)} {stem}: {len(rows)} {r['split']} windows", flush=True)
     frame = pd.DataFrame(all_rows)
     frame.to_csv(out / "samples.csv", index=False)
-    counts = {s: np.bincount(frame.loc[frame.split.eq(s), "label"], minlength=50).tolist() for s in ["train", "val"]}
+    counts = {split: class_counts(frame.loc[frame.split.eq(split), "label"]).tolist() for split in ["train", "val"]}
     if any(c == 0 for c in counts["train"]):
         missing = [vocab[i] for i, c in enumerate(counts["train"]) if c == 0]
         raise ValueError(f"Training subset missing classes {missing}; expand tasks/sessions")
@@ -180,6 +287,8 @@ def prepare(args):
 
 
 class EpochDataset(Dataset):
+    """Memory-mapped cache of normalized 1-second epochs."""
+
     def __init__(self, frame):
         self.rows = list(frame[["file", "epoch", "label"]].itertuples(index=False, name=None))
         self.arrays = {}
@@ -211,33 +320,35 @@ class TemporalCNN(nn.Module):
         super().__init__()
         if width % 8:
             raise ValueError("width must be divisible by 8")
-        self.encoder = nn.Sequential(nn.Conv1d(306, width, 1), nn.GroupNorm(8, width), nn.GELU(),
+        self.encoder = nn.Sequential(nn.Conv1d(N_CHANNELS, width, 1), nn.GroupNorm(8, width), nn.GELU(),
                                      nn.AvgPool1d(2),
                                      *(TemporalBlock(width, d, dropout) for d in [1, 2, 4, 8]))
         # Four bins preserve onset-relative latency, unlike global pooling alone.
-        self.head = nn.Sequential(nn.AdaptiveAvgPool1d(4), nn.Flatten(), nn.Dropout(dropout), nn.Linear(width*4, 50))
+        self.head = nn.Sequential(nn.AdaptiveAvgPool1d(4), nn.Flatten(), nn.Dropout(dropout), nn.Linear(width*4, N_CLASSES))
 
     def forward(self, x):
         return self.head(self.encoder(x))
 
 
 def balanced_metrics(logits, labels, k=10):
+    """Competition-style balanced recall@k over the fixed 50-word vocabulary."""
     logits, labels = np.asarray(logits), np.asarray(labels, dtype=np.int64)
-    if logits.ndim != 2 or logits.shape[1] != 50 or len(logits) != len(labels):
+    if logits.ndim != 2 or logits.shape[1] != N_CLASSES or len(logits) != len(labels):
         raise ValueError("Expected N x 50 logits and N labels")
-    if not np.isfinite(logits).all() or np.any((labels < 0) | (labels >= 50)) or not 1 <= k <= 50:
+    if not np.isfinite(logits).all() or np.any((labels < 0) | (labels >= N_CLASSES)) or not 1 <= k <= N_CLASSES:
         raise ValueError("Invalid scores, labels or k")
     # Stable sort makes tied-score behavior reproducible.
     top = np.argsort(-logits, axis=1, kind="stable")[:, :k]
     correct = (top == labels[:, None]).any(axis=1)
-    counts = np.bincount(labels, minlength=50)
-    hits = np.bincount(labels, weights=correct, minlength=50)
-    recall = np.divide(hits, counts, out=np.zeros(50), where=counts > 0)
+    counts = np.bincount(labels, minlength=N_CLASSES)
+    hits = np.bincount(labels, weights=correct, minlength=N_CLASSES)
+    recall = np.divide(hits, counts, out=np.zeros(N_CLASSES), where=counts > 0)
     return {"bacc": float(recall.mean()), "bacc_present": float(recall[counts > 0].mean()),
             "coverage": int((counts > 0).sum()), "per_class_recall": recall.tolist()}
 
 
 def augment(x):
+    """Lightweight augmentation consistent with single-trial MEG baselines."""
     x = x.clone()
     keep = (torch.rand(x.shape[0], x.shape[1], 1, device=x.device) > 0.05)
     x *= keep
@@ -258,42 +369,36 @@ def evaluate(model, loader, device):
 
 
 def train(args):
+    """Train the baseline model and save auditable validation artifacts."""
     cfg = config(args.config)
     if args.epochs is not None:
         cfg['epochs'] = args.epochs
     data, out = Path(args.data), Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
-    prepared = config(data / "prepared_config.json")
-    for key in ["tasks", "val_fraction", "seed", "revisions"]:
-        if cfg[key] != prepared[key]:
-            raise ValueError(f"Training config differs from preparation: {key}")
+    paths = ArtifactPaths(out)
+    verify_prepared_config(data, cfg)
     seed_everything(cfg["seed"], cfg["threads"])
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     frame = pd.read_csv(data / "samples.csv")
-    train_rows, val_rows = frame[frame.split.eq("train")], frame[frame.split.eq("val")]
-    for rows in [train_rows, val_rows]:
-        if not len(rows):
-            raise ValueError("Empty train/validation split")
-    train_groups = set(zip(train_rows.task, train_rows.subject, train_rows.session))
-    assert not train_groups.intersection(zip(val_rows.task, val_rows.subject, val_rows.session))
-    counts = np.bincount(train_rows.label, minlength=50)
+    train_rows, val_rows = split_sample_frame(frame)
+    counts = class_counts(train_rows.label)
     if np.any(counts == 0):
         raise ValueError("Training must cover every competition word")
     generator = torch.Generator().manual_seed(cfg["seed"])
     train_loader = DataLoader(EpochDataset(train_rows), batch_size=cfg["batch_size"], shuffle=True, generator=generator)
     val_loader = DataLoader(EpochDataset(val_rows), batch_size=cfg["batch_size"])
-    model = TemporalCNN(cfg["width"], cfg["dropout"]).to(device)
+    model = build_model(cfg).to(device)
     weights = (counts.sum() / counts) ** 0.5
     weights /= weights.mean()
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32, device=device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, cfg["epochs"])
     versions = {p: importlib.metadata.version(p) for p in ["torch", "numpy", "pandas", "h5py", "pnpl", "huggingface_hub"]}
-    save_json(out / "run_config.json", {"config": cfg, "versions": versions, "device": str(device),
-                                         "parameters": sum(p.numel() for p in model.parameters())})
+    save_json(paths.run_config, {"config": cfg, "versions": versions, "device": str(device),
+                                 "parameters": sum(p.numel() for p in model.parameters())})
     history, best, stale, start_epoch = [], -1, 0, 0
     if args.resume:
-        latest = out / 'latest.pt'
+        latest = paths.latest_checkpoint
         if latest.exists():
             # This file is produced locally by this program, not an untrusted download.
             state = torch.load(latest, map_location='cpu', weights_only=False)
@@ -309,14 +414,14 @@ def train(args):
             random.setstate(state['python_rng'])
             generator.set_state(state['loader_rng'])
             history, best, stale, start_epoch = state['history'], state['best'], state['stale'], state['epoch']
-        elif (out / 'best.pt').exists():
+        elif paths.best_checkpoint.exists():
             # Compatibility with the first run before latest-state saving was added.
-            state = torch.load(out / 'best.pt', map_location='cpu', weights_only=True)
+            state = torch.load(paths.best_checkpoint, map_location='cpu', weights_only=True)
             model.load_state_dict(state['state_dict'])
             start_epoch = state['epoch']
-            history = config(out / 'history.json')[:start_epoch]
+            history = config(paths.history)[:start_epoch]
             best = max(r['val_bacc10'] for r in history)
-            save_json(out / 'resume_note.json', {'warm_start_epoch': start_epoch,
+            save_json(paths.resume_note, {'warm_start_epoch': start_epoch,
                       'warning': 'First interrupted run saved weights only; optimizer and RNG reset for this continuation.'})
             print('Warm-starting saved weights; optimizer reset (recorded in resume_note.json)', flush=True)
         else:
@@ -343,12 +448,12 @@ def train(args):
                "val_bacc1": top1["bacc"], "val_coverage": top10["coverage"], "seconds": time.monotonic()-started}
         history.append(row)
         print(json.dumps(row), flush=True)
-        save_json(out / "history.json", history)
+        save_json(paths.history, history)
         if top10["bacc"] > best:
             best, stale = top10["bacc"], 0
             torch.save({"state_dict": model.cpu().state_dict(), "config": cfg,
                         "vocabulary": config(data / "vocabulary.json"), "epoch": epoch+1,
-                        "train_counts": counts.tolist()}, out / "best.pt")
+                        "train_counts": counts.tolist()}, paths.best_checkpoint)
             model.to(device)
         else:
             stale += 1
@@ -357,32 +462,31 @@ def train(args):
                     'history': history, 'best': best, 'stale': stale,
                     'torch_rng': torch.get_rng_state(), 'numpy_rng': np.random.get_state(),
                     'python_rng': random.getstate(), 'loader_rng': generator.get_state(),
-                    'cuda_rng': torch.cuda.get_rng_state_all() if device.type == 'cuda' else None}, out / 'latest.pt')
+                    'cuda_rng': torch.cuda.get_rng_state_all() if device.type == 'cuda' else None}, paths.latest_checkpoint)
         if stale >= cfg["patience"]:
             break
-    checkpoint = torch.load(out / "best.pt", map_location=device, weights_only=True)
+    checkpoint = torch.load(paths.best_checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["state_dict"])
     logits, labels = evaluate(model, val_loader, device)
     # Cross-entropy weighting is intentionally moderate. A small prior correction
     # is selected on validation to target macro recall rather than class frequency.
     log_prior = np.log(counts/counts.sum())
-    trials = [{"alpha": a, "bacc10": balanced_metrics(logits-a*log_prior, labels)["bacc"]}
-              for a in [0.0, 0.25, 0.5, 0.75, 1.0]]
-    alpha = max(trials, key=lambda t: t["bacc10"])["alpha"]
+    alpha, trials = choose_prior_alpha(logits, labels, log_prior)
     checkpoint["prior_alpha"] = alpha
-    torch.save(checkpoint, out / "best.pt")
+    torch.save(checkpoint, paths.best_checkpoint)
     corrected = logits - alpha*log_prior
-    np.savez(out / "validation_predictions.npz", logits=logits, labels=labels)
-    val_rows.to_csv(out / "validation_rows.csv", index=False)
+    np.savez(paths.validation_predictions, logits=logits, labels=labels)
+    val_rows.to_csv(paths.validation_rows, index=False)
     report = {"best_epoch": checkpoint["epoch"], "raw_top10": balanced_metrics(logits, labels),
               "corrected_top10": balanced_metrics(corrected, labels), "corrected_top1": balanced_metrics(corrected, labels, 1),
               "prior_alpha": alpha, "calibration_search": trials,
               "warning": "Validation also selects checkpoint/prior correction; not an independent test estimate."}
-    save_json(out / "validation_report.json", report)
+    save_json(paths.validation_report, report)
     print(json.dumps(report), flush=True)
 
 
 def predict(args):
+    """Run the trained model on the official deep holdout and write a CSV."""
     from pnpl.competition import LibriBrainCompetitionHoldout, load_vocabulary, write_submission
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     cfg = checkpoint["config"]
@@ -393,7 +497,7 @@ def predict(args):
     for suffix in ["holdout01_sentence", "holdout2_word"]:
         download("pnpl/LibriBrain-Competition-2026", f"COMPETITION_HOLDOUT/subj00_{suffix}.npz", cfg, base)
     holdout = LibriBrainCompetitionHoldout(track="deep", data_path=base, download=False)
-    model = TemporalCNN(cfg["width"], cfg["dropout"])
+    model = build_model(cfg)
     model.load_state_dict(checkpoint["state_dict"])
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model.to(device).eval()
@@ -405,7 +509,7 @@ def predict(args):
             logits -= checkpoint.get("prior_alpha", 0.0) * log_prior
             probabilities.append(torch.from_numpy(logits).softmax(-1).numpy())
     scores = np.concatenate(probabilities)
-    if scores.shape != (len(holdout.indices), 50) or not np.isfinite(scores).all():
+    if scores.shape != (len(holdout.indices), N_CLASSES) or not np.isfinite(scores).all():
         raise ValueError("Invalid holdout predictions")
     Path(args.csv).parent.mkdir(parents=True, exist_ok=True)
     write_submission(args.csv, indices=holdout.indices, primary_probs=scores)
@@ -417,6 +521,7 @@ def predict(args):
 
 
 def submit(args):
+    """Submit an already-written CSV through the Kaggle CLI."""
     if not Path(args.csv).is_file():
         raise FileNotFoundError(args.csv)
     authenticated = bool(os.getenv("KAGGLE_API_TOKEN")) or bool(os.getenv("KAGGLE_USERNAME") and os.getenv("KAGGLE_KEY")) or (Path.home()/".kaggle/kaggle.json").exists()
