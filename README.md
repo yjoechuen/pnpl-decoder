@@ -1,6 +1,6 @@
 # pnpl-decoder
 
-Reproducible first baseline for [PNPL Competition 2026: Deep](https://www.kaggle.com/competitions/pnpl-competition-2026-deep).
+Develop code in this Git repository; **run training in a Kaggle Notebook with GPU T4 x2** for [PNPL Competition 2026: Deep](https://www.kaggle.com/competitions/pnpl-competition-2026-deep).
 Predict 50 word scores from one `(306, 250)` MEG window. Primary metric: macro per-word recall at top 10 (chance 20%); top-1 balanced accuracy breaks ties.
 
 ## What this repo does
@@ -14,21 +14,79 @@ This repo is deliberately narrow:
 
 It is **not** trying to be a general-purpose framework yet.
 
-## Setup and run
+## Kaggle setup and daily workflow
 
-Python 3.10+; install the appropriate PyTorch build for your hardware first. CPU works for this compact baseline; GPU is recommended for scaling.
+Create a Kaggle Notebook, select **Settings → Accelerator → GPU T4 x2**, and enable **Internet**. Account verification and available quota may be required. Keep Kaggle's preinstalled CUDA-enabled PyTorch: **do not install a CPU-only torch build**.
 
-```bash
-python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-python3 -m pip install -e '.[dev]'
-python3 -m pytest -q
-pnpl-decoder prepare
-pnpl-decoder train
-pnpl-decoder predict
-pnpl-decoder submit
+Import `kaggle_notebook.ipynb` into Kaggle, or start with these cells:
+
+```python
+from pathlib import Path
+import subprocess
+import sys
+
+repo = Path('/kaggle/working/pnpl-decoder')
+if not repo.exists():
+    subprocess.run(['git', 'clone', 'https://github.com/yjoechuen/pnpl-decoder.git', str(repo)], check=True)
+sys.path.insert(0, str(repo))
+from kaggle_runner import sync_repo, KaggleExperiment
+sync_repo(ref='main')  # Prefer an exact commit SHA for a recorded experiment.
+
+import torch
+print(torch.__version__, torch.cuda.device_count())
+assert torch.cuda.is_available(), 'Enable GPU in notebook settings'
+run = KaggleExperiment(output='/kaggle/working/experiment-001')
 ```
 
-For CUDA, install a CUDA PyTorch build instead of the CPU build; training/inference automatically selects CUDA when available. Use `--device cpu` to override.
+Run each stage in a separate cell, **in this order**:
+
+```python
+run.prepare()
+```
+
+```python
+run.train(devices=2)  # Use devices=1 for comparison or if only one GPU is available.
+```
+
+```python
+submission = run.predict()  # Always regenerate after training finishes.
+```
+
+Download `/kaggle/working/submission_deep.csv` from notebook outputs and use Kaggle's **Submit Predictions**. No API token is needed for manual upload. Never put tokens in notebook source; optional HF authentication belongs in Kaggle Secrets.
+
+### Edit locally → push → train remotely
+
+1. Edit model/config/tests locally, run tests, commit, and push your branch.
+2. In a fresh Kaggle notebook session, set `sync_repo(ref='your-branch-or-commit')` to load that code.
+3. Reuse the prepared data when unchanged; choose a **new output directory per experiment**.
+4. Train, inspect local validation, then generate predictions from the selected checkpoint.
+5. Save a Kaggle notebook version with outputs, and download `best.pt`, `latest.pt`, configuration and reports before ending the session.
+
+`sync_repo` refuses to overwrite local edits and only performs fast-forward branch updates. Restart the notebook Python session when updating helper code; training itself runs in fresh subprocesses so model edits do not suffer from stale imports. A private repo requires authentication configured separately—never embed credentials in the clone URL.
+
+### Using both T4s
+
+`run.train(devices=2)` or `pnpl-decoder train --device cuda --devices 2` explicitly enables **DataParallel** across both T4s. The configured batch size is **global**, split between GPUs; GPU memory is not pooled. This small CNN may actually run faster on one GPU because replication/communication overhead dominates. Benchmark both before using two GPUs for larger models. DistributedDataParallel and mixed precision are not yet implemented.
+
+Checkpoints use plain model keys, so two-GPU-trained weights work for single-GPU inference. Resume trusted local checkpoints with `run.train(devices=2, resume=True)` using the same configuration and training data. Save/copy the entire output directory before a session ends; `/kaggle/working` is not guaranteed to persist across sessions. Do not load untrusted `latest.pt` files.
+
+### Data and storage
+
+Default downloads are a small subset, not the full dataset. `run.prepare()` defaults to disk-efficient HDF5 indexing (`--index-only`): it avoids storing duplicated epoch arrays and writes `samples_h5.csv`. Training selects that index automatically if no epoch cache exists. Use `run.prepare(index_only=False)` for the faster, larger epoch cache. HDF5 reading can become the GPU bottleneck; benchmark both within your storage budget.
+
+Prepare/cache data in a CPU session to save GPU quota, then attach a **private Kaggle Dataset** containing that cache for subsequent runs. Attached `/kaggle/input` data is read-only: don't run preparation there. HDF5 indices use relative paths for recordings under the cache root, allowing relocation. The original epoch cache stores absolute paths, so moving it requires copying it back to its original `/kaggle/working` path or explicitly rebasing its `samples.csv` paths. Keep validation groups fixed when expanding training data.
+
+### Local development
+
+Python 3.10+; install a PyTorch build appropriate for your local hardware, then:
+
+```bash
+python3 -m pip install -e '.[dev]'
+python3 -m pytest -q
+```
+
+Local CPU tests cover pipeline behavior. CUDA smoke tests run only when GPUs are available. One/two-GPU checkpoint compatibility is covered; actual two-T4 throughput must be verified in Kaggle.
+
 Fixed seeds and deterministic-kernel preferences are enabled. Unsupported deterministic CUDA operations (such as adaptive-pooling backward) emit warnings instead of stopping training. GPU runs are not guaranteed to be bitwise reproducible. The tests include a CUDA forward/backward/optimizer smoke test, skipped on CPU-only systems.
 The final command uploads to the requested competition and requires Kaggle authentication and accepted rules. Set `KAGGLE_API_TOKEN` securely in your shell/environment; **never commit credentials**. Check the competition's current deadline and submission allowance before uploading. This workspace initially has neither GPU nor Kaggle credentials.
 
@@ -44,6 +102,8 @@ Convolutional temporal backbones and ensembles were effective in the [organizers
 pnpl-decoder/
 ├── decoder.py          # CLI + data prep + training + inference
 ├── config.json         # baseline subset and hyperparameters
+├── kaggle_runner.py    # notebook helpers: sync, prepare, train, predict
+├── kaggle_notebook.ipynb # importable Kaggle entry point
 ├── tests/test_decoder.py
 └── README.md
 ```

@@ -354,6 +354,32 @@ def build_model(cfg: dict[str, Any]) -> nn.Module:
     return TemporalCNN(cfg["width"], cfg["dropout"])
 
 
+def configure_gpus(model: nn.Module, device: torch.device, devices: int) -> nn.Module:
+    """Use one or two GPUs; serialize the underlying model's portable weights.
+
+    DataParallel uses a global batch size. For this small baseline its overhead
+    may exceed its benefit; benchmark against one GPU before scaling up.
+    """
+    if devices < 1 or (devices > 1 and device.type != "cuda"):
+        raise ValueError("Multiple devices require CUDA; --devices must be positive")
+    if device.type == "cuda" and devices > torch.cuda.device_count():
+        raise ValueError(f"Requested {devices} GPUs, available {torch.cuda.device_count()}")
+    model = model.to(device)
+    if devices > 1:
+        model = PortableDataParallel(model, device_ids=list(range(devices)))
+    return model
+
+
+class PortableDataParallel(nn.DataParallel):
+    """DataParallel execution with single-model state_dict compatibility."""
+
+    def state_dict(self, *args, **kwargs):
+        return self.module.state_dict(*args, **kwargs)
+
+    def load_state_dict(self, *args, **kwargs):
+        return self.module.load_state_dict(*args, **kwargs)
+
+
 def choose_prior_alpha(logits: np.ndarray, labels: np.ndarray, log_prior: np.ndarray) -> tuple[float, list[dict[str, float]]]:
     trials = [
         {"alpha": alpha, "bacc10": balanced_metrics(logits - alpha * log_prior, labels)["bacc"]}
@@ -671,7 +697,7 @@ def train(args):
 
     train_loader = DataLoader(dataset(train_rows), batch_size=cfg["batch_size"], shuffle=True, generator=generator)
     val_loader = DataLoader(dataset(val_rows), batch_size=cfg["batch_size"])
-    model = build_model(cfg).to(device)
+    model = configure_gpus(build_model(cfg), device, getattr(args, "devices", 1))
     weights = (counts.sum() / counts) ** 0.5
     weights /= weights.mean()
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32, device=device))
@@ -713,6 +739,7 @@ def train(args):
         else:
             raise FileNotFoundError('No checkpoint to resume')
     save_json(paths.run_config, {"config": cfg, "versions": versions, "device": str(device),
+                                 "devices": getattr(args, "devices", 1),
                                 "data_mode": data_mode, "sample_fingerprint": fingerprint,
                                 "parameters": sum(p.numel() for p in model.parameters())})
     for epoch in range(start_epoch, cfg["epochs"]):
@@ -848,6 +875,7 @@ def build_parser():
                    help="auto prefers existing samples.csv epoch cache, otherwise samples_h5.csv")
     p.add_argument("--device", choices=["cpu", "cuda"])
     p.add_argument("--resume", action="store_true", help="Resume trusted local latest.pt, or warm-start best.pt")
+    p.add_argument("--devices", type=int, default=1, help="GPU count; 2 uses both Kaggle T4s with a global batch size")
     p.add_argument("--epochs", type=int, help="Override epoch budget")
     p.set_defaults(fn=train)
     p = sub.add_parser("predict")
