@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 ROOT = Path(__file__).resolve().parent
 COMPETITION = "pnpl-competition-2026-deep"
@@ -337,6 +337,8 @@ def verify_prepared_config(data_dir: Path, cfg: dict[str, Any]) -> dict[str, Any
             raise ValueError(f"Training config differs from preparation: {key}")
     if select_training_records(cfg) != select_training_records(prepared):
         raise ValueError("Training validation groups differ from prepared split")
+    if cfg.get('purge_repeated_sentences',False) != prepared.get('purge_repeated_sentences',False):
+        raise ValueError('Sentence purging policy differs from prepared cache')
     return prepared
 
 
@@ -379,6 +381,10 @@ def build_model(cfg: dict[str, Any]) -> nn.Module:
         return WideResidualCNN(cfg["width"], cfg["dropout"],
                                dilations=cfg.get("cnn_dilations", [1, 2, 4, 8, 1, 2]),
                                pooling_bins=cfg.get("pooling_bins", 8))
+    if name == "temporal_spatial_cnn":
+        from models import TemporalSpatialCNN
+        return TemporalSpatialCNN(banks=cfg.get('temporal_banks',32),depth=cfg.get('spatial_depth',2),
+                                  dropout=cfg['dropout'],pooling_bins=cfg.get('pooling_bins',8))
     raise ValueError(f"Unknown model: {name}")
 
 
@@ -445,13 +451,36 @@ def prepare(args):
     words_by_run = {}
     for r in records:
         event_name, _ = recording_names(r)
-        words_by_run[run_stem(r)] = read_word_events(download(r["repo"], event_name, cfg, raw), mapping)
+        event_path = download(r["repo"], event_name, cfg, raw)
+        all_events = pd.read_csv(event_path, sep='\t')
+        words = read_word_events(event_path, mapping)
+        if cfg.get('purge_repeated_sentences') and r['task'] in ['TIMIT','MOCHATIMIT']:
+            from research import add_stimulus_keys
+            words['stimulus_key'] = add_stimulus_keys(all_events).loc[words.index]
+            if words['stimulus_key'].isna().any():
+                raise ValueError('Missing sentence IDs; refusing sentence validation')
+        words_by_run[run_stem(r)] = words
+    # Remove whole repeated sentence texts from training when they occur in
+    # sentence-domain validation. Uses metadata only, never model outcomes.
+    reserved_sentences = set()
+    for r in records:
+        words = words_by_run[run_stem(r)]
+        if r['split']=='val' and 'stimulus_key' in words:
+            reserved_sentences.update(words.stimulus_key)
+    purged = 0
+    for r in records:
+        words = words_by_run[run_stem(r)]
+        if r['split']=='train' and 'stimulus_key' in words:
+            keep = ~words.stimulus_key.isin(reserved_sentences)
+            purged += int((~keep).sum())
+            words_by_run[run_stem(r)] = words.loc[keep]
     cache_bytes = 0 if index_only else sum(
         len(words) * N_CHANNELS * WINDOW_SAMPLES * 4 + 256 for words in words_by_run.values())
     h5_download_bytes = sum(f["download_bytes"] for f in plan["files"] if f["name"].endswith(".h5"))
     check_disk_space(out, raw, h5_download_bytes, cache_bytes, budget, headroom)
     out.mkdir(parents=True, exist_ok=True)
     plan["epoch_cache_bytes_upper_bound"] = cache_bytes
+    plan['sentence_windows_purged'] = purged
     save_json(out / "download_plan.json", plan)
     save_json(out / "prepared_config.json", cfg)
     save_json(out / "vocabulary.json", vocab)
@@ -486,6 +515,7 @@ def prepare(args):
                 if h5_path.is_relative_to(out.resolve()):
                     h5_path = h5_path.relative_to(out.resolve())
                 rows.append({"file": str(epoch_path.resolve()), "epoch": len(rows), "label": int(row.label),
+                              "stimulus_key": row.get('stimulus_key',''),
                              "h5_file": str(h5_path),
                              "start_sample": start,
                              "word": vocab[int(row.label)], "onset": onset, "event_index": int(event_idx),
@@ -506,6 +536,10 @@ def prepare(args):
                           "h5_bytes": path.stat().st_size})
         print(f"Prepared {number + 1}/{len(records)} {stem}: {len(rows)} {r['split']} windows", flush=True)
     frame = pd.DataFrame(all_rows)
+    if cfg.get('purge_repeated_sentences'):
+        sentence = frame[frame.task.isin(['TIMIT','MOCHATIMIT'])]
+        if set(sentence.loc[sentence.split.eq('train'),'stimulus_key']) & set(sentence.loc[sentence.split.eq('val'),'stimulus_key']):
+            raise ValueError('Repeated sentence text crosses development splits')
     split_sample_frame(frame)
     counts = {split: class_counts(frame.loc[frame.split.eq(split), "label"]).tolist() for split in ["train", "val"]}
     if any(c == 0 for c in counts["train"]):
@@ -544,7 +578,7 @@ class EpochDataset(Dataset):
 class H5WindowDataset(Dataset):
     """Slice and normalize one window at a time; handles are process-local and bounded."""
 
-    def __init__(self, frame, data_dir: Path, max_open_files: int = 4):
+    def __init__(self, frame, data_dir: Path, max_open_files: int = 4, normalization='window_zscore', stats=None):
         if max_open_files < 1:
             raise ValueError("max_open_files must be positive")
         self.rows = []
@@ -561,6 +595,7 @@ class H5WindowDataset(Dataset):
         self.max_open_files = max_open_files
         self.handles = OrderedDict()
         self.pid = os.getpid()
+        self.normalization, self.stats = normalization, stats
 
     def __len__(self):
         return len(self.rows)
@@ -598,7 +633,8 @@ class H5WindowDataset(Dataset):
         data = self.handles[path]["data"]
         if start + WINDOW_SAMPLES > data.shape[1]:
             raise ValueError(f"HDF5 window exceeds recording boundary: {path}")
-        return torch.from_numpy(normalize_windows(data[:, start:start + WINDOW_SAMPLES])), label
+        from research import preprocess
+        return torch.from_numpy(preprocess(data[:, start:start + WINDOW_SAMPLES], self.normalization, self.stats)), label
 
 
 def training_frame(data: Path, mode: str) -> tuple[pd.DataFrame, str]:
@@ -710,23 +746,46 @@ def train(args):
     if not args.resume and (paths.latest_checkpoint.exists() or paths.best_checkpoint.exists()):
         raise ValueError("Output already contains checkpoints; use --resume or a new --output directory")
     verify_prepared_config(data, cfg)
-    seed_everything(cfg["seed"], cfg["threads"])
+    train_seed = cfg.get('training_seed',cfg['seed'])
+    seed_everything(train_seed, cfg["threads"])
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     frame, data_mode = training_frame(data, getattr(args, "data_mode", "auto"))
     fingerprint = sample_fingerprint(frame)
     train_rows, val_rows = split_sample_frame(frame)
+    original_train_rows = train_rows.copy()
+    if cfg.get('shuffle_training_labels',False):
+        train_rows = train_rows.copy()
+        train_rows['label'] = np.random.default_rng(train_seed).permutation(train_rows.label.to_numpy())
     counts = class_counts(train_rows.label)
     if np.any(counts == 0):
         raise ValueError("Training must cover every competition word")
-    generator = torch.Generator().manual_seed(cfg["seed"])
+    generator = torch.Generator().manual_seed(train_seed)
+    norm = cfg.get('normalization','window_zscore')
+    if norm != 'window_zscore' and data_mode != 'h5':
+        raise ValueError('Normalization ablation requires --data-mode h5 (raw windows)')
+    if norm not in ['window_zscore','train_channel_zscore']:
+        raise ValueError('Unknown normalization')
+    stats = None
+    if norm == 'train_channel_zscore':
+        from research import fit_channel_stats
+        stats = fit_channel_stats(original_train_rows,data,max_windows=cfg.get('stats_windows',512))
+        save_json(out/'preprocessing_stats.json',stats)
 
     def dataset(rows):
-        return H5WindowDataset(rows, data) if data_mode == "h5" else EpochDataset(rows)
+        return H5WindowDataset(rows, data, normalization=norm, stats=stats) if data_mode == "h5" else EpochDataset(rows)
 
-    train_loader = DataLoader(dataset(train_rows), batch_size=cfg["batch_size"], shuffle=True, generator=generator)
+    sampling = cfg.get('sampling','natural')
+    if sampling not in ['natural','class_balanced']:
+        raise ValueError('Unknown sampling policy')
+    sampler = WeightedRandomSampler(torch.tensor(1/counts[train_rows.label.to_numpy()],dtype=torch.double),
+                                   len(train_rows),replacement=True,generator=generator) if sampling=='class_balanced' else None
+    train_loader = DataLoader(dataset(train_rows), batch_size=cfg["batch_size"], shuffle=sampler is None,
+                              sampler=sampler, generator=generator)
     val_loader = DataLoader(dataset(val_rows), batch_size=cfg["batch_size"])
     model = configure_gpus(build_model(cfg), device, getattr(args, "devices", 1))
-    weights = (counts.sum() / counts) ** 0.5
+    weights = (counts.sum() / counts) ** cfg.get('loss_weight_power',0.5)
+    if sampling=='class_balanced' and cfg.get('loss_weight_power',0.5)!=0:
+        raise ValueError('Class-balanced sampling requires loss_weight_power=0 to avoid double balancing')
     weights /= weights.mean()
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32, device=device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
@@ -814,6 +873,12 @@ def train(args):
             stale += 1
         if best_state is None:
             best_state = torch.load(paths.best_checkpoint, map_location='cpu', weights_only=True)
+        best_state['preprocessing_stats'] = stats
+        if epoch+1 in cfg.get('save_epochs',[]):
+            save_checkpoint(out/f'epoch_{epoch+1:03d}.pt',{
+                'state_dict':{k:v.detach().cpu().clone() for k,v in model.state_dict().items()},
+                'config':cfg,'vocabulary':config(data/'vocabulary.json'),'epoch':epoch+1,
+                'train_counts':counts.tolist(),'preprocessing_stats':stats,'prior_alpha':0.0})
         # latest.pt is authoritative, including best weights if interruption occurs
         # between the separate best/history writes.
         save_checkpoint(paths.latest_checkpoint, {'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
@@ -844,6 +909,12 @@ def train(args):
               "prior_alpha": alpha, "calibration_search": trials,
               "warning": "Validation also selects checkpoint/prior correction; not an independent test estimate."}
     save_json(paths.validation_report, report)
+    from research import domain_report
+    save_json(out/'domain_report.json',domain_report(logits,labels,val_rows,counts))
+    if cfg.get('evaluate_training',False):
+        clean_loader=DataLoader(dataset(original_train_rows),batch_size=cfg['batch_size'])
+        train_logits,train_labels=evaluate(model,clean_loader,device)
+        save_json(out/'training_evaluation.json',domain_report(train_logits,train_labels,original_train_rows,counts))
     print(json.dumps(report), flush=True)
 
 
@@ -862,6 +933,8 @@ def predict(args):
     from pnpl.competition import LibriBrainCompetitionHoldout, load_vocabulary, write_submission
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     cfg = checkpoint["config"]
+    if cfg.get('shuffle_training_labels',False):
+        raise ValueError('Shuffled-label negative controls cannot generate competition submissions')
     seed_everything(cfg["seed"], cfg["threads"])
     if checkpoint["vocabulary"] != list(load_vocabulary("primary")):
         raise ValueError("Competition vocabulary differs from checkpoint")
@@ -877,7 +950,9 @@ def predict(args):
     probabilities = []
     with torch.inference_mode():
         for meg, _ in holdout.iter_windows(batch_size=cfg["batch_size"]):
-            logits = model(torch.from_numpy(normalize_windows(meg)).to(device)).cpu().numpy()
+            from research import preprocess
+            normalized = preprocess(meg,cfg.get('normalization','window_zscore'),checkpoint.get('preprocessing_stats'))
+            logits = model(torch.from_numpy(normalized).to(device)).cpu().numpy()
             logits = prediction_logits(logits, checkpoint, alpha)
             probabilities.append(torch.from_numpy(logits).softmax(-1).numpy())
     scores = np.concatenate(probabilities)

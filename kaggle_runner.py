@@ -47,13 +47,14 @@ class KaggleExperiment:
             args += ["--disk-budget-gib", disk_budget_gib]
         self._run("prepare", *args)
 
-    def train(self, devices=2, epochs=None, resume=False):
+    def train(self, devices=2, epochs=None, resume=False, data_mode='auto'):
         args = ["--config", self.config, "--data", self.data, "--output", self.output,
                 "--device", "cuda", "--devices", devices]
         if epochs is not None:
             args += ["--epochs", epochs]
         if resume:
             args += ["--resume"]
+        args += ['--data-mode',data_mode]
         self._run("train", *args)
 
     def predict(self, csv="/kaggle/working/submission_deep.csv", prior_corrected=False):

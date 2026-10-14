@@ -1,0 +1,17 @@
+{
+  "data_config": "development_data.json",
+  "selection": "Inspect each domain and class coverage; no holdout or final-test tuning.",
+  "reference": "Retrain the reference on this new split; old weights trained on Sherlock2 are invalid here.",
+  "variants": [
+    "reference",
+    "small_reference",
+    "small_balanced",
+    "balanced",
+    "temporal_spatial",
+    "train_normalization",
+    "dropout",
+    "shuffled_control",
+    "seed2027",
+    "seed2028"
+  ]
+}

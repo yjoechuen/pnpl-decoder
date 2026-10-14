@@ -16,7 +16,7 @@ dev = ["pytest>=8", "kaggle>=2"]
 pnpl-decoder = "decoder:main"
 
 [tool.setuptools]
-py-modules = ["decoder", "final_test", "models", "kaggle_runner"]
+py-modules = ["decoder", "final_test", "models", "kaggle_runner", "research", "study"]
 
 [tool.setuptools.data-files]
 "share/pnpl-decoder" = ["config.json", "config_conformer.json", "config_wide_cnn.json", "config_wide_cnn_expanded.json", "final_test.json"]

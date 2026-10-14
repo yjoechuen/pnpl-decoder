@@ -22,6 +22,38 @@ class WideResidualBlock(nn.Module):
         return x + 0.5 * self.net(x)
 
 
+class TemporalSpatialCNN(nn.Module):
+    """EEGNet-inspired temporal banks then bank-specific full-sensor spatial filters.
+
+    A compact hypothesis for MEG; no claim of published competition performance.
+    Shared temporal filters precede spatial mixing, unlike our baseline encoder.
+    """
+
+    def __init__(self, banks=32, depth=2, dropout=0.3, pooling_bins=8):
+        super().__init__()
+        if banks < 1 or depth < 1 or (banks*depth) % 8:
+            raise ValueError('banks*depth must be a positive multiple of 8')
+        width = banks*depth
+        self.temporal = nn.Conv2d(1, banks, (1, 31), padding=(0,15), bias=False)
+        self.spatial = nn.Sequential(nn.Conv2d(banks, width, (306,1), groups=banks, bias=False),
+                                     nn.GroupNorm(8,width), nn.GELU())
+        self.encoder = nn.Sequential(nn.AvgPool1d(2),
+                                     WideResidualBlock(width,1,dropout), WideResidualBlock(width,2,dropout),
+                                     WideResidualBlock(width,4,dropout))
+        self.bins = pooling_bins
+        if not 1 <= pooling_bins <=125:
+            raise ValueError('Invalid pooling bins')
+        self.head = nn.Sequential(nn.Flatten(),nn.Dropout(dropout),nn.Linear(width*pooling_bins,50))
+
+    def forward(self,x):
+        if x.ndim!=3 or x.shape[1:]!=(306,250):
+            raise ValueError('Expected batch x 306 x 250')
+        x=self.spatial(self.temporal(x[:,None])).squeeze(2)
+        x=self.encoder(x)
+        pooled=torch.stack([p.mean(-1) for p in torch.tensor_split(x,self.bins,dim=-1)],dim=-1)
+        return self.head(pooled)
+
+
 class WideResidualCNN(nn.Module):
     """Wider baseline-like sensor/temporal CNN retaining onset-relative latency.
 

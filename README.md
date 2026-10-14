@@ -1,5 +1,13 @@
 # pnpl-decoder
 
+**Start here for new experiments:** [RESEARCH_PLAN.md](RESEARCH_PLAN.md).
+The current emphasis is domain generalization and controlled experiments, not
+larger models selected on narrative-only validation. `study.py` creates configs,
+audits development data, evaluates early checkpoints and raw ensembles;
+`research.py` implements label-blind preprocessing and per-domain diagnostics.
+
+Completed runs and model-decision notes: [EXPERIMENT_RESULTS.md](EXPERIMENT_RESULTS.md).
+
 Develop code in this Git repository; **run training in a Kaggle Notebook with GPU T4 x2** for [PNPL Competition 2026: Deep](https://www.kaggle.com/competitions/pnpl-competition-2026-deep).
 Predict 50 word scores from one `(306, 250)` MEG window. Primary metric: macro per-word recall at top 10 (chance 20%); top-1 balanced accuracy breaks ties.
 

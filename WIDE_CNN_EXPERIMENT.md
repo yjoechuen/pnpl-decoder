@@ -1,5 +1,10 @@
 # Wider residual CNN and modest data expansion
 
+**Completed run:** epoch 13 selected, raw BAcc@10 **32.96%**; early stopping at
+epoch 19. Full history, metrics and next decisions are in
+[EXPERIMENT_RESULTS.md](EXPERIMENT_RESULTS.md). This is user-reported Kaggle
+training validation, not a Kaggle leaderboard score.
+
 The Conformer learned slowly in the reported run. This candidate returns to
 the baseline's sensor projection and residual temporal convolutions rather
 than adding attention. It is implemented and CPU-tested, **not yet GPU-scored**.

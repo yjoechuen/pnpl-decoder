@@ -1,5 +1,10 @@
 # Kaggle free-GPU training: step by step
 
+**Latest direction:** follow [RESEARCH_PLAN.md](RESEARCH_PLAN.md) for the
+generalization-first suite: new temporal-first spatial CNN, held-out-book and
+sentence validation, balancing/normalization ablations, controls and ensembles.
+The steps below retain the older expanded wide-CNN run for reproduction.
+
 Develop and commit code in this repository, then train it in a Kaggle Notebook.
 This guide trains the **wider residual CNN** from `config_wide_cnn_expanded.json`,
 with extra Sherlock and Moth training sessions and unchanged validation sessions.
@@ -20,7 +25,7 @@ still needs the hardware smoke test below; CPU tests alone do not verify CUDA.
 
 ## 1. Create a Kaggle Notebook
 
-1. Open <https://www.kaggle.com/code> and create a notebook.
+1. Open [https://www.kaggle.com/code](https://www.kaggle.com/code) and create a notebook.
 2. Select **Settings → Accelerator → GPU T4 x2**.
 3. Enable **Internet**.
 4. Complete account verification if requested.
@@ -197,7 +202,7 @@ Expected output: **960 rows, 50 primary scores**.
 
 Download the CSV from notebook outputs and upload it through the competition's
 **Submit Predictions** page:
-<https://www.kaggle.com/competitions/pnpl-competition-2026-deep>.
+[https://www.kaggle.com/competitions/pnpl-competition-2026-deep](https://www.kaggle.com/competitions/pnpl-competition-2026-deep).
 Accept the rules and check that submissions are open. Manual upload requires
 no API token in your notebook. Verify scoring status after upload.
 
