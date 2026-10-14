@@ -1,5 +1,9 @@
 # Kaggle free-GPU training: step by step
 
+Notebook helpers now display compact live progress/ETA bars and one metrics
+line per epoch. Full reports are saved to files. See the output controls in
+[RESEARCH_PLAN.md](RESEARCH_PLAN.md#clean-notebook-output).
+
 **Latest direction:** follow [RESEARCH_PLAN.md](RESEARCH_PLAN.md) for the
 generalization-first suite: new temporal-first spatial CNN, held-out-book and
 sentence validation, balancing/normalization ablations, controls and ensembles.

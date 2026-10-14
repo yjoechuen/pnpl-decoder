@@ -57,6 +57,27 @@ coverage. Do not score the final test until model choices are frozen.
 
 ## Kaggle cells
 
+### Clean notebook output
+
+`KaggleExperiment` automatically detects notebook execution and renders child
+progress events as live tqdm bars. Preparation shows metadata/recording progress;
+training shows an epoch-budget bar with best raw score and patience, plus a
+batch-level train/validation bar. Prediction and normalization fitting have bars
+too. Bars show elapsed time, throughput and ETA, estimated from completed work.
+The epoch ETA is for the maximum budget, not a forecast of early stopping;
+download estimates are recording-level, not byte-level, and vary with file sizes.
+
+Each epoch prints one compact loss/raw-recall line. Full history, class recalls,
+config and domain metrics remain in JSON/NPZ files, not giant notebook blocks.
+Low-level Hugging Face download bars are hidden only in helper-launched notebook
+processes; important warnings and tracebacks remain visible. To force notebook
+rendering use `KaggleExperiment(..., notebook_progress=True)`; use `False` for
+plain subprocess/terminal tqdm. Interrupting a helper cell terminates its child
+process. Refresh imported helpers in a fresh notebook session after pulling.
+
+Commands launched directly with `!python ...` use terminal progress bars, not
+native notebook widgets. Use helpers for the cleanest training display.
+
 Load updated code in a fresh session using the quickstart setup. Generate
 configs if changing the suite generator:
 

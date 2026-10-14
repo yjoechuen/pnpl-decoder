@@ -1,7 +1,56 @@
 """Notebook helpers that launch fresh processes, avoiding stale Python imports."""
 from pathlib import Path
+import json
+import os
 import subprocess
 import sys
+
+
+def notebook_process(command):
+    """Render throttled child events as two reusable notebook bars; stream errors."""
+    from tqdm.auto import tqdm
+    from progress import PREFIX
+    env=dict(os.environ,PNPL_NOTEBOOK_PROGRESS='1',HF_HUB_DISABLE_PROGRESS_BARS='1',PYTHONUNBUFFERED='1')
+    bars={}
+    process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                             text=True,bufsize=1,env=env)
+    try:
+        for line in process.stdout:
+            if not line.startswith(PREFIX):
+                print(line.rstrip(),flush=True)
+                continue
+            event=json.loads(line[len(PREFIX):])
+            key=event['key']
+            if key not in bars:
+                bars[key]=tqdm(total=event['total'],desc=event['description'],mininterval=1,
+                               leave=key=='epochs')
+            bar=bars[key]
+            if event['n']<bar.n or event['total']!=bar.total:
+                bar.reset(total=event['total'])
+            bar.set_description(event['description'],refresh=False)
+            bar.update(event['n']-bar.n)
+            if event['metrics']:bar.set_postfix(event['metrics'],refresh=False)
+            if event['closed']:
+                bar.close()
+                del bars[key]
+        code=process.wait()
+        if code:raise subprocess.CalledProcessError(code,command)
+    finally:
+        for bar in bars.values():bar.close()
+        if process.poll() is None:
+            process.terminate()
+            try:process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill();process.wait()
+        process.stdout.close()
+
+
+def in_notebook():
+    try:
+        from IPython import get_ipython
+        return get_ipython() is not None and getattr(get_ipython(),'kernel',None) is not None
+    except ImportError:
+        return False
 
 
 def sync_repo(ref="main", destination="/kaggle/working/pnpl-decoder",
@@ -20,7 +69,7 @@ def sync_repo(ref="main", destination="/kaggle/working/pnpl-decoder",
     branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=repo, text=True).strip()
     if branch:
         subprocess.run(["git", "pull", "--ff-only", "origin", branch], cwd=repo, check=True)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-e", str(repo)], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "-e", str(repo)], check=True)
     return repo
 
 
@@ -28,12 +77,15 @@ class KaggleExperiment:
     """Prepare, train on T4 x2, then predict with a portable best checkpoint."""
 
     def __init__(self, repo="/kaggle/working/pnpl-decoder", data="/kaggle/working/pnpl-data",
-                 output="/kaggle/working/baseline", config=None):
+                 output="/kaggle/working/baseline", config=None, notebook_progress=None):
         self.repo, self.data, self.output = map(Path, (repo, data, output))
         self.config = Path(config) if config else self.repo / "config.json"
+        self.notebook_progress=in_notebook() if notebook_progress is None else notebook_progress
 
     def _run(self, command, *args):
-        subprocess.run([sys.executable, str(self.repo / "decoder.py"), command, *map(str, args)], check=True)
+        cmd=[sys.executable,str(self.repo/'decoder.py'),command,*map(str,args)]
+        if self.notebook_progress:notebook_process(cmd)
+        else:subprocess.run(cmd,check=True)
 
     def prepare(self, index_only=True, raw=None, preflight=False, disk_budget_gib=None):
         args = ["--config", self.config, "--data", self.data]

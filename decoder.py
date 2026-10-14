@@ -34,6 +34,7 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from progress import Progress, progress_iter
 
 ROOT = Path(__file__).resolve().parent
 COMPETITION = "pnpl-competition-2026-deep"
@@ -443,13 +444,15 @@ def prepare(args):
                  "epoch_cache_bytes": None if not index_only else 0,
                  "note": "Exact remote payload sizes; epoch allocation checked after event-only download. "
                          "Indexes, HF metadata and download scratch need filesystem headroom."})
-    print(json.dumps(plan, indent=2), flush=True)
+    print(f"Data: {len(records)} recordings | raw {plan['raw_bytes']/GIB:.2f} GiB | "
+          f"download {plan['download_bytes']/GIB:.2f} GiB | mode {'HDF5 index' if index_only else 'epoch cache'}",flush=True)
     check_disk_space(out, raw, plan["download_bytes"], 0, budget, headroom)
     if getattr(args, "preflight", False):
+        print(f"Disk check passed; reserve {headroom:g} GiB. No payloads downloaded.",flush=True)
         return
     # Event files are small. Count all vocabulary windows before any H5 download.
     words_by_run = {}
-    for r in records:
+    for r in progress_iter(records,len(records),'Event metadata',key='metadata'):
         event_name, _ = recording_names(r)
         event_path = download(r["repo"], event_name, cfg, raw)
         all_events = pd.read_csv(event_path, sep='\t')
@@ -486,7 +489,7 @@ def prepare(args):
     save_json(out / "vocabulary.json", vocab)
     save_json(out / "split_manifest.json", records)
     all_rows, summaries = [], []
-    for number, r in enumerate(records):
+    for number, r in enumerate(progress_iter(records,len(records),'Prepare recordings',key='prepare')):
         stem = run_stem(r)
         words = words_by_run[stem]
         _, h5_name = recording_names(r)
@@ -534,7 +537,6 @@ def prepare(args):
         all_rows.extend(rows)
         summaries.append({**r, "samples": len(rows), "boundary_dropped": dropped,
                           "h5_bytes": path.stat().st_size})
-        print(f"Prepared {number + 1}/{len(records)} {stem}: {len(rows)} {r['split']} windows", flush=True)
     frame = pd.DataFrame(all_rows)
     if cfg.get('purge_repeated_sentences'):
         sentence = frame[frame.task.isin(['TIMIT','MOCHATIMIT'])]
@@ -553,7 +555,8 @@ def prepare(args):
               "n_samples": len(frame), "missing_val_classes": [vocab[i] for i,c in enumerate(counts['val']) if not c],
               "normalization": "per-window, per-channel population z-score; clip [-10,10]",
               "window_seconds": [0, 1], "sfreq": 250, "training_partition": "official train only"})
-    print(json.dumps({"samples": len(frame), "split_counts": frame.split.value_counts().to_dict()}), flush=True)
+    print(f"Ready: {len(frame):,} windows | train {sum(counts['train']):,} | "
+          f"val {sum(counts['val']):,} | purged {purged:,} | metadata: {out}",flush=True)
 
 
 class EpochDataset(Dataset):
@@ -725,10 +728,10 @@ def augment(x):
 
 
 @torch.inference_mode()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, description='Validate'):
     model.eval()
     logits, labels = [], []
-    for x, y in loader:
+    for x, y in progress_iter(loader,len(loader),description,key='batches'):
         logits.append(model(x.to(device)).cpu().numpy())
         labels.append(y.numpy())
     return np.concatenate(logits), np.concatenate(labels)
@@ -829,6 +832,9 @@ def train(args):
                                  "devices": getattr(args, "devices", 1),
                                 "data_mode": data_mode, "sample_fingerprint": fingerprint,
                                 "parameters": sum(p.numel() for p in model.parameters())})
+    print(f"Train: {cfg.get('model','temporal_cnn')} | {device} × {getattr(args,'devices',1)} | "
+          f"{len(train_rows):,} train / {len(val_rows):,} val | batch {cfg['batch_size']} | {data_mode}",flush=True)
+    epoch_bar=Progress(cfg['epochs'],'Epochs (maximum budget)',key='epochs',initial=start_epoch,leave=True)
     for epoch in range(start_epoch, cfg["epochs"]):
         if stale >= cfg["patience"]:
             break
@@ -837,7 +843,7 @@ def train(args):
         total, n = 0.0, 0
         train_counts = np.zeros(N_CLASSES, dtype=np.int64)
         train_hits = np.zeros(N_CLASSES, dtype=np.int64)
-        for x, y in train_loader:
+        for x, y in progress_iter(train_loader,len(train_loader),f'Train epoch {epoch+1}',key='batches'):
             x, y = augment(x.to(device)), y.to(device)
             optimizer.zero_grad(set_to_none=True)
             batch_logits = model(x)
@@ -863,7 +869,8 @@ def train(args):
                "train_bacc10_online": float(train_recall.mean()), "val_loss": val_loss,
                "val_bacc1": top1["bacc"], "val_coverage": top10["coverage"], "seconds": time.monotonic()-started}
         history.append(row)
-        print(json.dumps(row), flush=True)
+        print(f"Epoch {epoch+1:02d}/{cfg['epochs']} | loss {total/n:.3f} | val loss {val_loss:.3f} | "
+              f"raw@10 {top10['bacc']:.2%} | raw@1 {top1['bacc']:.2%} | {row['seconds']:.0f}s",flush=True)
         if top10["bacc"] > best:
             best, stale = top10["bacc"], 0
             best_state = {"state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
@@ -890,8 +897,10 @@ def train(args):
                      'cuda_rng': torch.cuda.get_rng_state_all() if device.type == 'cuda' else None})
         save_checkpoint(paths.best_checkpoint, best_state)
         save_json(paths.history, history)
+        epoch_bar.update(best=f'{best:.2%}',patience=f'{stale}/{cfg["patience"]}')
         if stale >= cfg["patience"]:
             break
+    epoch_bar.close()
     checkpoint = torch.load(paths.best_checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["state_dict"])
     logits, labels = evaluate(model, val_loader, device)
@@ -915,7 +924,8 @@ def train(args):
         clean_loader=DataLoader(dataset(original_train_rows),batch_size=cfg['batch_size'])
         train_logits,train_labels=evaluate(model,clean_loader,device)
         save_json(out/'training_evaluation.json',domain_report(train_logits,train_labels,original_train_rows,counts))
-    print(json.dumps(report), flush=True)
+    print(f"Finished: best epoch {checkpoint['epoch']} | raw@10 {report['raw_top10']['bacc']:.2%} | "
+          f"reports and checkpoints: {out}",flush=True)
 
 
 def prediction_logits(logits, checkpoint, alpha=0.0):
@@ -949,7 +959,8 @@ def predict(args):
     alpha = checkpoint.get("prior_alpha", 0.0) if getattr(args, "prior_corrected", False) else 0.0
     probabilities = []
     with torch.inference_mode():
-        for meg, _ in holdout.iter_windows(batch_size=cfg["batch_size"]):
+        batches=(len(holdout.indices)+cfg['batch_size']-1)//cfg['batch_size']
+        for meg, _ in progress_iter(holdout.iter_windows(batch_size=cfg["batch_size"]),batches,'Predict',key='predict'):
             from research import preprocess
             normalized = preprocess(meg,cfg.get('normalization','window_zscore'),checkpoint.get('preprocessing_stats'))
             logits = model(torch.from_numpy(normalized).to(device)).cpu().numpy()

@@ -27,7 +27,8 @@ def fit_channel_stats(frame, data_dir, max_windows=512):
         raise ValueError('Statistics must be fitted on training rows only')
     indices = np.linspace(0, len(frame)-1, min(max_windows, len(frame)), dtype=int)
     sums, squares, count = np.zeros(306), np.zeros(306), 0
-    for row in frame.iloc[indices].itertuples():
+    from progress import progress_iter
+    for row in progress_iter(frame.iloc[indices].itertuples(),len(indices),'Fit training normalization',key='stats'):
         path = Path(row.h5_file)
         path = path if path.is_absolute() else Path(data_dir) / path
         from decoder import reject_final_test_path
@@ -84,7 +85,9 @@ def audit_cache(data_dir, holdout_dir=None):
     split_sample_frame(frame)
     report = {'files': [], 'limitations': ['Channel ordering cannot be certified if channel names are absent.',
               'Filtering and event onset provenance require comparison with official holdout metadata.']}
-    for name, rows in frame.groupby('h5_file'):
+    from progress import progress_iter
+    groups=frame.groupby('h5_file')
+    for name, rows in progress_iter(groups,len(groups),'Audit recordings',key='audit'):
         path = Path(name)
         path = path if path.is_absolute() else data_dir/path
         reject_final_test_path(path)
