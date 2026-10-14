@@ -1,0 +1,10 @@
+{
+  "repo": "pnpl/LibriBrain",
+  "revision": "5a7c332b34fc7be329c4df3e527a41f67bfd878f",
+  "subject": "0",
+  "session": "12",
+  "task": "Sherlock1",
+  "run": "2",
+  "partition": "test",
+  "purpose": "Locked final evaluation only; never development feedback"
+}

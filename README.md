@@ -79,6 +79,104 @@ If you want to explore multiple models, the cleanest next step is to keep the pr
 - saves `best.pt` and resumable `latest.pt`,
 - writes validation predictions and a compact report.
 
+### Disk-efficient preparation and paths
+
+The original epoch cache remains supported and is still the default. To avoid
+storing both full recordings and expanded float32 epochs, use HDF5 on-demand
+windows. This retains the selected processed H5 recordings and event TSVs,
+not raw acquisition files, and normalizes each requested window identically to
+the epoch cache. It trades repeated disk reads/normalization for less storage;
+it is not remote streaming and does not rotate or delete shards.
+
+```bash
+# Metadata only: exact processed-H5/event sizes at the configured revisions.
+# No data downloads, training, or preparation-directory creation.
+pnpl-decoder prepare --index-only --preflight --disk-budget-gib 20 --headroom-gib 5
+
+# Separate index alongside existing epochs; existing samples.csv stays intact.
+pnpl-decoder prepare --index-only --disk-budget-gib 20 --headroom-gib 5
+pnpl-decoder train --data-mode h5 --output artifacts/h5-run
+```
+
+`--preflight` reports each pinned file's exact remote payload size, totals for
+H5/events, and additional download bytes. A same-sized local file is assumed
+complete for budgeting, not cryptographically verified; Hugging Face still
+handles download metadata and resumption. Existing incomplete downloads are
+conservatively charged the full payload, not only the remaining transfer bytes.
+If remote metadata is missing/unavailable, preparation fails closed rather than
+guessing. `--disk-budget-gib` caps existing plus additional preparation data in
+the data/raw directories; training artifacts are outside that budget.
+`--headroom-gib` reserves free filesystem space (default 5 GiB), separately on
+each filesystem when data and raw paths differ. Headroom also accommodates
+indexes, download metadata/scratch, and other overhead; payload totals are not
+an exact peak-filesystem prediction. Other concurrent writers can still exhaust disk.
+
+For epoch mode the payload-only preflight cannot know the cache size without
+events. Actual preparation downloads the small event TSVs first, counts matching
+words, then checks a conservative epoch-cache upper bound before downloading
+any H5. It rechecks headroom before each H5. Cache replacement may temporarily
+need both old and new files; existing caches are counted conservatively, even
+if reusable. Index-only mode allocates no epoch files. The plan is saved in
+`download_plan.json`; its local/download flags describe the initial preflight.
+
+Index-only preparation writes `samples_h5.csv` and `data_report_h5.json` without
+deleting or replacing existing epochs, `samples.csv`, or `data_report.json`.
+Both index formats from new preparation include `h5_file` and `start_sample`.
+`train --data-mode auto` prefers existing `samples.csv` epochs, otherwise the H5
+index; select `h5` explicitly if both exist. Legacy epoch indexes still work.
+H5 paths inside the data directory are relative so copying that directory to
+Kaggle works; external `--raw` paths and legacy epoch paths are absolute and
+must be kept at the same location or updated after copying. H5 handles are
+process-local and limited to four open recordings; CLI loaders use zero workers.
+
+All CLI data/output paths can be overridden. Defaults remain repository-local
+with `--profile workspace`. `--profile kaggle` (before the subcommand) defaults
+to `/kaggle/working/pnpl-decoder/{data,artifacts}`; installed wheels include the
+baseline config. `prepare --raw PATH` separates recordings from the index/cache.
+Use a new data directory for a different preparation config; do not rebuild or
+delete existing artifacts just to switch storage modes.
+
+```bash
+pnpl-decoder --profile kaggle prepare --data /kaggle/working/my-data --index-only --disk-budget-gib 15
+pnpl-decoder --profile kaggle train --data /kaggle/working/my-data --data-mode h5
+```
+
+### Resume and Kaggle
+
+`pnpl-decoder train --resume` restores trusted local `latest.pt`: model, AdamW
+moments, cosine scheduler, Python/NumPy/CPU torch/CUDA RNGs, shuffle generator,
+history, best metric and early-stop counter. Resume uses the **same config and
+total epoch budget** (including `--epochs`); changing the cosine schedule is not
+an exact continuation. New checkpoints also validate a path-independent sample
+index fingerprint and embed best weights. Legacy latest checkpoints remain
+supported but lack that fingerprint/embedded best state, so keep their companion
+`best.pt`. The old weights-only fallback is explicitly a warm start, not full
+resume, and records the optimizer/RNG reset in `resume_note.json`.
+
+Checkpoint and JSON writes use same-filesystem temporary files, fsync and atomic
+replacement. `latest.pt` is authoritative if interruption occurs between epoch
+artifact writes; resume repairs best/history from it. Best tensors are copied
+to CPU without moving the live model/optimizer. Completed or early-stopped runs
+do not take extra optimization steps on resume; validation artifacts can be
+regenerated. A non-resume run refuses an output containing checkpoints.
+Resume is at **completed epoch boundaries**, not mid-batch: an interrupted epoch
+is replayed from the last checkpoint. Bitwise equivalence is not promised across
+devices/library versions or unsupported deterministic CUDA kernels. Preserve
+`latest.pt` and the same data/config outside ephemeral Kaggle sessions.
+
+`kaggle_entry.ipynb` only installs a pinned repository commit and invokes the CLI;
+it has no duplicate model/training code. After these changes are published,
+fill `REPO_COMMIT` with that full 40-character SHA. It deliberately refuses an
+unset pin rather than silently installing the older remote commit or a moving
+branch. Dependencies other than `pnpl` remain version ranges, not an environment
+lock; run versions are recorded. Enable Internet/GPU, set a disk budget, and
+restore trusted checkpoints before setting `RESUME=True`. The notebook does not
+touch the reserved final test or automatically predict/submit.
+Set notebook `CONFIG` to a custom config path used by both preparation and
+training, or leave it `None` for the installed baseline. For resume, set
+`TOTAL_EPOCHS` to the original `--epochs` override if one was used, not the
+remaining epochs; leave it `None` when the config's epoch budget was used.
+
 ### 3. Predict
 
 `pnpl-decoder predict`
@@ -108,6 +206,40 @@ If you want to explore multiple models, the cleanest next step is to keep the pr
 Changing the preparation config requires a new `--data` cache directory (or explicit deletion/rebuild). For larger runs add `Sherlock2` … `Sherlock9`, more `TheMoth`, and subsequently audited TIMIT/MOCHATIMIT data, increase width/epochs and train multiple seeds. Do not assume all >100 hours fit on a small workspace disk.
 
 ## Outputs
+
+### Reserved final test (not development feedback)
+
+`final_test.json` reserves the official **Sherlock1 subject 0, session 12, run 2**
+test record at a pinned Hugging Face revision. It is excluded from the existing
+training/validation manifest and remains excluded when official training data expands.
+Prepare it separately, without evaluating a model:
+
+```bash
+python final_test.py
+```
+
+The default cache is `/workspace/protected/pnpl-final-test`, **outside this repo**.
+It contains normalized `(306, 250)` windows, separate labels, vocabulary, row
+provenance, and a checksummed manifest. Preparation checks disk headroom and
+session disjointness; output paths must not overlap the repository or development
+directory in either direction, including resolved symlinks. Reruns verify the
+saved cache and restore its protection marker if missing or changed. Installed
+packages find the default reservation JSON in `sys.prefix/share/pnpl-decoder`
+when it is not beside the module. Training rejects final-test
+markers, non-training partitions, and unexpected split labels.
+
+This single audiobook session tests within-corpus generalization, not performance
+across all corpora. Class coverage is recorded, not used to adapt the test set.
+No model should be scored on it until search is finished and a candidate/config,
+checkpoint, preprocessing, and prior correction have been frozen on development
+data. Do not feed final-test results back into automated search.
+
+**Protection limits:** the cache directory has owner-only permissions, but same-user
+code can still read it, and the source is publicly downloadable. Future generated-code
+workers must have no network and no mount of this directory, raw test data, or labels.
+Use a separate user/container and a trusted external scorer for real isolation.
+This setup supplies accidental-use guards, not that sandbox. No final-test evaluation
+command is added yet, deliberately avoiding premature exposure of scores.
 
 `data/split_manifest.json`, `samples.csv`, `vocabulary.json`, `data_report.json`: reproducible splits, label mapping, coverage and provenance.
 
