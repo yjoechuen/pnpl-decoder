@@ -351,7 +351,16 @@ def class_counts(labels: pd.Series | np.ndarray) -> np.ndarray:
 
 def build_model(cfg: dict[str, Any]) -> nn.Module:
     """Single extension point for swapping in future model architectures."""
-    return TemporalCNN(cfg["width"], cfg["dropout"])
+    name = cfg.get("model", "temporal_cnn")  # Legacy checkpoints remain loadable.
+    if name == "temporal_cnn":
+        return TemporalCNN(cfg["width"], cfg["dropout"])
+    if name == "multiscale_conformer":
+        from models import MultiScaleConformer
+        return MultiScaleConformer(cfg["width"], cfg["dropout"],
+                                   layers=cfg.get("conformer_layers", 4),
+                                   heads=cfg.get("attention_heads", 4),
+                                   kernel_size=cfg.get("conformer_kernel", 15))
+    raise ValueError(f"Unknown model: {name}")
 
 
 def configure_gpus(model: nn.Module, device: torch.device, devices: int) -> nn.Module:

@@ -16,6 +16,10 @@ It is **not** trying to be a general-purpose framework yet.
 
 ## Kaggle setup and daily workflow
 
+For the new model, follow [KAGGLE_QUICKSTART.md](KAGGLE_QUICKSTART.md): it prepares
+the shared baseline data and trains `config_conformer.json` in a separate output
+directory. The short workflow below remains the original CNN baseline.
+
 Create a Kaggle Notebook, select **Settings → Accelerator → GPU T4 x2**, and enable **Internet**. Account verification and available quota may be required. Keep Kaggle's preinstalled CUDA-enabled PyTorch: **do not install a CPU-only torch build**.
 
 Import `kaggle_notebook.ipynb` into Kaggle, or start with these cells:
@@ -91,6 +95,11 @@ Fixed seeds and deterministic-kernel preferences are enabled. Unsupported determ
 The final command uploads to the requested competition and requires Kaggle authentication and accepted rules. Set `KAGGLE_API_TOKEN` securely in your shell/environment; **never commit credentials**. Check the competition's current deadline and submission allowance before uploading. This workspace initially has neither GPU nor Kaggle credentials.
 
 ## Evidence-based model, not a claimed winning solution
+
+**New GPU candidate:** [multi-scale CNN–Conformer experiment](CONFORMER_EXPERIMENT.md),
+configured in `config_conformer.json`. The original CNN remains the default so
+old checkpoints continue to load. The candidate reuses the baseline data/split;
+it is implemented and CPU-tested, not yet GPU-benchmarked or scored on Kaggle.
 
 The encoder is a small sensor-projection CNN followed by four residual, dilated depthwise temporal convolution blocks, GroupNorm, GELU and four-bin temporal pooling. It preserves onset-relative latency and predicts individual unknown-label test trials—**no same-label trial averaging**. Training uses AdamW, cosine decay, gradient clipping, square-root inverse-frequency cross-entropy weights, sensor dropout and short time masking. Independent per-window/channel normalization is identical at training and inference and respects the very small physical units of MEG.
 
