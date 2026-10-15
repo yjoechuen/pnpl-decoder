@@ -81,3 +81,67 @@ checkpoint hash, history, vocabulary, validation predictions/rows and prediction
 mode. Record unsuccessful runs too. Separate local model-selection scores from
 independent holdout results. Machine-readable entries should explicitly mark
 unavailable metadata, rather than guess it.
+
+## Development suite on held-out-book + sentence validation
+
+**Source:** user-supplied Kaggle logs from the generalization-first development
+suite. These are local development results, not Kaggle leaderboard scores.
+The executed commit was likely recent `main`, but no exact SHA, checkpoint hash,
+or sidecar JSON was supplied, so they are left unknown.
+
+Machine-readable transcription:
+[results/development_suite_run01.json](results/development_suite_run01.json).
+
+### Shared setup
+
+- Development split: 22,063 training windows and 21,499 validation windows.
+- Validation includes original Sherlock1/Moth sessions plus held-out Sherlock2
+  and sentence-domain validation, making it much harder than the older three-session split.
+- Execution shown in logs: `cuda × 2`, `data_mode="h5"`, batch size 128.
+- Current objective: **raw** BAcc@10.
+
+### Results recorded so far
+
+| Run | Best epoch | Best raw BAcc@10 | Best raw BAcc@1 | Runtime per epoch | Status |
+|---|---:|---:|---:|---:|---|
+| `small_reference` | 7 | **28.00%** | 3.28% | 75–80 s | completed |
+| `small_balanced` | 3 | **29.13%** | 4.30% | 71–80 s | completed |
+| `temporal_spatial_cnn` | 7 | **28.30%** | 3.54% | 186–194 s | completed |
+
+### Public Kaggle scores from this suite
+
+| Submission | Development source | Prediction mode | Kaggle score |
+|---|---|---|---:|
+| `submission_small_balanced_raw.csv` | `small_balanced`, epoch 3 | raw | **22.905%** |
+| `submission_temporal_spatial.csv` | `temporal_spatial_cnn`, epoch 7 | raw | **28.785%** |
+
+These scores are user-reported Kaggle public results. Exact submission-sidecar
+metadata, checkpoint hashes and executed commit SHA were not supplied here.
+
+### Immediate interpretation
+
+1. **Balanced sampling improved the small CNN.** `small_balanced` outperformed
+   `small_reference` by about 1.13 raw percentage points on this harder split.
+2. **The temporal-first spatial CNN transferred better to Kaggle despite weaker
+   local development score.** This reverses the local ranking and is currently the
+   strongest empirical result in the repository.
+3. **Our current development metric is still mismatched to holdout utility.** The
+   model with lower local raw BAcc@10 achieved the best Kaggle score.
+4. **This suite is more realistic than the earlier narrative-only split.** Do not
+   compare its absolute percentages directly to older 32.96% wide-CNN validation.
+5. **Two GPUs appear underutilized for these small HDF5-fed CNNs.** Low utilization
+   is consistent with CPU/input bottlenecks rather than insufficient model size.
+
+### Next decisions informed by these logs
+
+- Use `temporal_spatial_cnn` as the current submission candidate and starting
+  point for follow-up experiments.
+- Prefer **one GPU** for similar CNN runs unless throughput measurements prove otherwise.
+- Do **not** deprioritize the temporal-spatial model based on local raw validation alone;
+  instead, treat this as evidence that its inductive bias may match the holdout better
+  than the current development suite reveals.
+- Next local comparisons should focus on **temporal-spatial variants**: balanced sampling,
+  dropout, training-only normalization, and additional training seeds.
+- Re-examine development reporting: per-domain scores, top-10 diversity, and any
+  sentence-vs-isolated-word gap may be more informative than one overall raw score.
+- Keep `small_balanced` as a useful fast baseline, but not as the leading model.
