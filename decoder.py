@@ -146,6 +146,33 @@ def seed_everything(seed: int, threads: int = 4) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def seed_worker(worker_id):
+    """Independent reproducible augmentation/NumPy seeds in loader processes."""
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def make_loader(dataset, cfg, device, shuffle=False, sampler=None, generator=None):
+    workers = int(cfg.get('num_workers', 0))
+    if workers < 0:
+        raise ValueError('num_workers must be nonnegative')
+    # Sampling RNG is checkpointed separately from worker/iterator base seeds.
+    # Dataset preprocessing is deterministic; augmentation happens in the parent.
+    if shuffle:
+        if sampler is not None:
+            raise ValueError('shuffle and sampler are mutually exclusive')
+        sampler = torch.utils.data.RandomSampler(dataset, generator=generator)
+    worker_generator = torch.Generator().manual_seed(cfg.get('training_seed',cfg.get('seed',2026)))
+    kwargs = dict(batch_size=cfg['batch_size'], shuffle=False, sampler=sampler,
+                   generator=worker_generator, num_workers=workers,
+                  pin_memory=device.type == 'cuda', worker_init_fn=seed_worker)
+    if workers:
+        kwargs.update(persistent_workers=True, prefetch_factor=cfg.get('prefetch_factor', 2),
+                      multiprocessing_context='spawn')
+    return DataLoader(dataset, **kwargs)
+
+
 def word_key(word: str) -> str:
     # Standardize typography, not lexical identity: do not strip internal apostrophes.
     return unicodedata.normalize("NFKC", str(word)).strip().lower().replace("’", "'").replace("‘", "'")
@@ -386,6 +413,15 @@ def build_model(cfg: dict[str, Any]) -> nn.Module:
         from models import TemporalSpatialCNN
         return TemporalSpatialCNN(banks=cfg.get('temporal_banks',32),depth=cfg.get('spatial_depth',2),
                                   dropout=cfg['dropout'],pooling_bins=cfg.get('pooling_bins',8))
+    if name == 'multiscale_spatial_cnn':
+        from models import MultiScaleSpatialCNN
+        if cfg.get('temporal_banks',32) != 32:
+            raise ValueError('Multiscale spatial CNN requires 32 temporal banks')
+        return MultiScaleSpatialCNN(dropout=cfg['dropout'],depth=cfg.get('spatial_depth',2),
+                                    pooling_bins=cfg.get('pooling_bins',8))
+    if name == 'geometry_cnn':
+        from models import GeometryCNN
+        return GeometryCNN(width=cfg.get('geometry_width',64),dropout=cfg['dropout'])
     raise ValueError(f"Unknown model: {name}")
 
 
@@ -433,9 +469,9 @@ def prepare(args):
     budget = getattr(args, "disk_budget_gib", None)
     reject_final_test_path(out)
     reject_final_test_path(raw)
-    # The preparation config is immutable unless the user removes/rebuilds the cache.
-    if (out / "prepared_config.json").exists() and config(out / "prepared_config.json") != cfg:
-        raise ValueError("Config differs from prepared cache; use a new --data directory")
+    # Only preparation-relevant fields must agree, not architecture/optimizer settings.
+    if (out / "prepared_config.json").exists():
+        verify_prepared_config(out, cfg)
     vocab, mapping = competition_vocabulary_mapping()
     records = select_training_records(cfg)
     plan = download_plan(records, cfg, raw)
@@ -648,7 +684,7 @@ def training_frame(data: Path, mode: str) -> tuple[pd.DataFrame, str]:
         path = data / "samples_h5.csv"
     else:
         path = data / "samples.csv"
-    frame = pd.read_csv(path)
+    frame = pd.read_csv(path, low_memory=False)
     if mode == "h5" and not {"h5_file", "start_sample"}.issubset(frame):
         raise ValueError("HDF5 index missing; run prepare --index-only first")
     return frame, mode
@@ -732,7 +768,7 @@ def evaluate(model, loader, device, description='Validate'):
     model.eval()
     logits, labels = [], []
     for x, y in progress_iter(loader,len(loader),description,key='batches'):
-        logits.append(model(x.to(device)).cpu().numpy())
+        logits.append(model(x.to(device,non_blocking=device.type=='cuda')).float().cpu().numpy())
         labels.append(y.numpy())
     return np.concatenate(logits), np.concatenate(labels)
 
@@ -778,14 +814,26 @@ def train(args):
         return H5WindowDataset(rows, data, normalization=norm, stats=stats) if data_mode == "h5" else EpochDataset(rows)
 
     sampling = cfg.get('sampling','natural')
-    if sampling not in ['natural','class_balanced']:
+    if sampling not in ['natural','class_balanced','corpus_balanced']:
         raise ValueError('Unknown sampling policy')
     sampler = WeightedRandomSampler(torch.tensor(1/counts[train_rows.label.to_numpy()],dtype=torch.double),
                                    len(train_rows),replacement=True,generator=generator) if sampling=='class_balanced' else None
-    train_loader = DataLoader(dataset(train_rows), batch_size=cfg["batch_size"], shuffle=sampler is None,
-                              sampler=sampler, generator=generator)
-    val_loader = DataLoader(dataset(val_rows), batch_size=cfg["batch_size"])
+    if sampling=='corpus_balanced':
+        domain=train_rows.task.map(lambda t:'Sherlock' if str(t).startswith('Sherlock') else t)
+        frequencies=domain.value_counts()
+        sampler=WeightedRandomSampler(torch.tensor(domain.map(lambda d:1/frequencies[d]).to_numpy(),dtype=torch.double),
+                                      len(train_rows),replacement=True,generator=generator)
+    train_loader = make_loader(dataset(train_rows),cfg,device,shuffle=sampler is None,
+                               sampler=sampler,generator=generator)
+    val_loader = make_loader(dataset(val_rows),cfg,device)
     model = configure_gpus(build_model(cfg), device, getattr(args, "devices", 1))
+    geometry_names = None
+    if cfg.get('model')=='geometry_cnn':
+        from models import load_sensor_geometry, dataset_channel_names
+        geometry_names = dataset_channel_names(frame,data)
+        target = model.module if isinstance(model,nn.DataParallel) else model
+        if not args.resume:
+            target.initialize_geometry(load_sensor_geometry(cfg['geometry_file'],geometry_names))
     weights = (counts.sum() / counts) ** cfg.get('loss_weight_power',0.5)
     if sampling=='class_balanced' and cfg.get('loss_weight_power',0.5)!=0:
         raise ValueError('Class-balanced sampling requires loss_weight_power=0 to avoid double balancing')
@@ -793,6 +841,8 @@ def train(args):
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32, device=device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, cfg["epochs"])
+    amp = bool(cfg.get('amp',False)) and device.type=='cuda'
+    scaler = torch.amp.GradScaler('cuda',enabled=amp)
     versions = {p: importlib.metadata.version(p) for p in ["torch", "numpy", "pandas", "h5py", "pnpl", "huggingface_hub"]}
     history, best, stale, start_epoch = [], -1, 0, 0
     best_state = None
@@ -805,7 +855,13 @@ def train(args):
                 raise ValueError('Resume config differs from latest checkpoint')
             if state.get('sample_fingerprint', fingerprint) != fingerprint:
                 raise ValueError('Resume sample index differs from latest checkpoint')
+            if geometry_names is not None and state.get('geometry_channel_names') != geometry_names:
+                raise ValueError('Resume geometry channel order differs from data')
             restore_training_state(state, model, optimizer, scheduler, generator, device)
+            if amp and state.get('scaler'):
+                scaler.load_state_dict(state['scaler'])
+            elif amp:
+                print('AMP enabled without saved scaler state; starting a fresh gradient scale.',flush=True)
             history, best, stale, start_epoch = state['history'], state['best'], state['stale'], state['epoch']
             best_state = state.get('best_checkpoint')
             if best_state is not None:
@@ -818,6 +874,8 @@ def train(args):
             state = torch.load(paths.best_checkpoint, map_location='cpu', weights_only=True)
             if state['config'] != cfg:
                 raise ValueError('Warm-start config differs from best checkpoint')
+            if geometry_names is not None and state.get('geometry_channel_names') != geometry_names:
+                raise ValueError('Warm-start geometry channel order differs from data')
             model.load_state_dict(state['state_dict'])
             best_state = state
             start_epoch = state['epoch']
@@ -830,6 +888,7 @@ def train(args):
             raise FileNotFoundError('No checkpoint to resume')
     save_json(paths.run_config, {"config": cfg, "versions": versions, "device": str(device),
                                  "devices": getattr(args, "devices", 1),
+                                 "amp_enabled":amp, "num_workers":cfg.get('num_workers',0),
                                 "data_mode": data_mode, "sample_fingerprint": fingerprint,
                                 "parameters": sum(p.numel() for p in model.parameters())})
     print(f"Train: {cfg.get('model','temporal_cnn')} | {device} × {getattr(args,'devices',1)} | "
@@ -843,30 +902,43 @@ def train(args):
         total, n = 0.0, 0
         train_counts = np.zeros(N_CLASSES, dtype=np.int64)
         train_hits = np.zeros(N_CLASSES, dtype=np.int64)
+        train_started=time.monotonic()
+        data_wait=0.0
+        previous=time.monotonic()
         for x, y in progress_iter(train_loader,len(train_loader),f'Train epoch {epoch+1}',key='batches'):
-            x, y = augment(x.to(device)), y.to(device)
+            data_wait += time.monotonic()-previous
+            x, y = augment(x.to(device,non_blocking=device.type=='cuda')), y.to(device,non_blocking=device.type=='cuda')
             optimizer.zero_grad(set_to_none=True)
-            batch_logits = model(x)
-            loss = criterion(batch_logits, y)
+            with torch.autocast(device_type=device.type,dtype=torch.float16,enabled=amp):
+                batch_logits = model(x)
+                loss = criterion(batch_logits, y)
             with torch.no_grad():
                 correct = (batch_logits.topk(10, dim=1).indices == y[:, None]).any(dim=1)
                 train_counts += torch.bincount(y, minlength=N_CLASSES).cpu().numpy()
                 train_hits += torch.bincount(y[correct], minlength=N_CLASSES).cpu().numpy()
             if not torch.isfinite(loss):
                 raise ValueError("Nonfinite training loss")
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             total += float(loss.detach()) * len(y)
             n += len(y)
+            previous=time.monotonic()
+        training_seconds=time.monotonic()-train_started
         scheduler.step()
+        validation_started=time.monotonic()
         logits, labels = evaluate(model, val_loader, device)
+        validation_seconds=time.monotonic()-validation_started
         top10, top1 = balanced_metrics(logits, labels), balanced_metrics(logits, labels, 1)
         train_recall = np.divide(train_hits, train_counts, out=np.zeros(N_CLASSES), where=train_counts > 0)
         # Standard unweighted CE: interpretable independently of class weighting.
         val_loss = torch.nn.functional.cross_entropy(torch.from_numpy(logits), torch.from_numpy(labels)).item()
         row = {"epoch": epoch + 1, "train_loss": total/n, "val_bacc10": top10["bacc"],
                "train_bacc10_online": float(train_recall.mean()), "val_loss": val_loss,
+               "train_seconds":training_seconds,"validation_seconds":validation_seconds,
+               "loader_wait_seconds":data_wait,"training_windows_per_second":n/training_seconds,
                "val_bacc1": top1["bacc"], "val_coverage": top10["coverage"], "seconds": time.monotonic()-started}
         history.append(row)
         print(f"Epoch {epoch+1:02d}/{cfg['epochs']} | loss {total/n:.3f} | val loss {val_loss:.3f} | "
@@ -875,7 +947,7 @@ def train(args):
             best, stale = top10["bacc"], 0
             best_state = {"state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
                           "config": cfg, "vocabulary": config(data / "vocabulary.json"), "epoch": epoch+1,
-                          "train_counts": counts.tolist()}
+                          "train_counts": counts.tolist(), 'geometry_channel_names':geometry_names}
         else:
             stale += 1
         if best_state is None:
@@ -885,10 +957,13 @@ def train(args):
             save_checkpoint(out/f'epoch_{epoch+1:03d}.pt',{
                 'state_dict':{k:v.detach().cpu().clone() for k,v in model.state_dict().items()},
                 'config':cfg,'vocabulary':config(data/'vocabulary.json'),'epoch':epoch+1,
-                'train_counts':counts.tolist(),'preprocessing_stats':stats,'prior_alpha':0.0})
+                'train_counts':counts.tolist(),'preprocessing_stats':stats,'prior_alpha':0.0,
+                'geometry_channel_names':geometry_names})
         # latest.pt is authoritative, including best weights if interruption occurs
         # between the separate best/history writes.
         save_checkpoint(paths.latest_checkpoint, {'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                      'scaler':scaler.state_dict(), 'amp_enabled':amp,
+                      'geometry_channel_names':geometry_names,
                     'scheduler': scheduler.state_dict(), 'config': cfg, 'epoch': epoch+1,
                     'history': history, 'best': best, 'stale': stale,
                     'torch_rng': torch.get_rng_state(), 'numpy_rng': np.random.get_state(),
@@ -921,9 +996,11 @@ def train(args):
     from research import domain_report
     save_json(out/'domain_report.json',domain_report(logits,labels,val_rows,counts))
     if cfg.get('evaluate_training',False):
-        clean_loader=DataLoader(dataset(original_train_rows),batch_size=cfg['batch_size'])
+        clean_loader=make_loader(dataset(original_train_rows),cfg,device)
         train_logits,train_labels=evaluate(model,clean_loader,device)
         save_json(out/'training_evaluation.json',domain_report(train_logits,train_labels,original_train_rows,counts))
+    save_json(out/'completed.json',{'config':cfg,'sample_fingerprint':fingerprint,
+                                  'best_epoch':checkpoint['epoch']})
     print(f"Finished: best epoch {checkpoint['epoch']} | raw@10 {report['raw_top10']['bacc']:.2%} | "
           f"reports and checkpoints: {out}",flush=True)
 

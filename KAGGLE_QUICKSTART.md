@@ -1,5 +1,9 @@
 # Kaggle free-GPU training: step by step
 
+**Current entry point:** [kaggle_spatial_next.ipynb](kaggle_spatial_next.ipynb)
+and [SPATIAL_NEXT_PLAN.md](SPATIAL_NEXT_PLAN.md) cover the complete staged
+spatial-model follow-up. Older steps below remain for reproduction.
+
 Notebook helpers now display compact live progress/ETA bars and one metrics
 line per epoch. Full reports are saved to files. See the output controls in
 [RESEARCH_PLAN.md](RESEARCH_PLAN.md#clean-notebook-output).

@@ -54,6 +54,90 @@ class TemporalSpatialCNN(nn.Module):
         return self.head(pooled)
 
 
+class MultiScaleSpatialCNN(nn.Module):
+    """Same total bank count as spatial baseline; kernels 15/31/63, no context."""
+    def __init__(self,dropout=.2,depth=2,pooling_bins=8):
+        super().__init__()
+        self.branches=nn.ModuleList([nn.Conv2d(1,b,(1,k),padding=(0,k//2),bias=False)
+                                    for b,k in [(10,15),(12,31),(10,63)]])
+        self.backbone=TemporalSpatialCNN(banks=32,depth=depth,dropout=dropout,pooling_bins=pooling_bins)
+        self.backbone.temporal=nn.Identity()
+
+    def forward(self,x):
+        if x.shape[1:]!=(306,250):raise ValueError('Expected 306 x 250')
+        temporal=torch.cat([branch(x[:,None]) for branch in self.branches],dim=1)
+        x=self.backbone.encoder(self.backbone.spatial(temporal).squeeze(2))
+        return self.backbone.head(torch.stack([p.mean(-1) for p in torch.tensor_split(x,self.backbone.bins,dim=-1)],dim=-1))
+
+
+def dataset_channel_names(frame,data_dir):
+    """Independently verify channel names/order across every indexed recording."""
+    from pathlib import Path
+    import h5py
+    from decoder import reject_final_test_path
+    expected=None
+    for filename in frame.h5_file.unique():
+        path=Path(filename)
+        if not path.is_absolute():path=Path(data_dir)/path
+        reject_final_test_path(path)
+        with h5py.File(path,'r') as f:
+            names=f.attrs.get('channel_names','')
+            if isinstance(names,bytes):names=names.decode()
+            names=[n.strip() for n in names.split(',')]
+        if len(names)!=306 or len(set(names))!=306:
+            raise ValueError('Missing or invalid H5 channel names')
+        if expected is not None and names!=expected:
+            raise ValueError('H5 channel order differs across recordings')
+        expected=names
+    if expected is None:raise ValueError('No recordings to verify')
+    return expected
+
+
+def load_sensor_geometry(path,expected):
+    """Require coordinates and names in actual H5 order; no guessed sensor layout."""
+    import json
+    import numpy as np
+    from pathlib import Path
+    data=json.loads(Path(path).read_text())
+    names=data['channel_names']
+    xyz=np.asarray(data['positions'],dtype='float32')
+    if names!=expected or len(names)!=306 or len(set(names))!=306 or xyz.shape!=(306,3) or not np.isfinite(xyz).all():
+        raise ValueError('Geometry must match verified H5 channel order')
+    if np.linalg.norm(xyz-xyz.mean(axis=0)) < 1e-6:
+        raise ValueError('Degenerate sensor geometry')
+    return xyz
+
+
+class GeometryCNN(nn.Module):
+    """Geometry-initialized spatial mixing + temporal CNN, BrainModule-inspired.
+
+    Not an exact BrainModule reproduction. Geometry supplies a smooth initial
+    attention prior; learned deviations can recover nonlocal sensor mixtures.
+    """
+    def __init__(self,width=64,dropout=.2):
+        super().__init__()
+        if width%8:raise ValueError('width must be divisible by 8')
+        self.register_buffer('spatial_prior',torch.zeros(width,306))
+        self.delta=nn.Parameter(torch.zeros(width,306))
+        self.encoder=nn.Sequential(nn.AvgPool1d(2),*[WideResidualBlock(width,d,dropout) for d in [1,2,4,8]])
+        self.attention=nn.Conv1d(width,1,1)
+        self.head=nn.Linear(width*5,50)
+
+    def initialize_geometry(self,xyz):
+        xyz=torch.as_tensor(xyz,dtype=torch.float32,device=self.spatial_prior.device)
+        scale=(xyz-xyz.mean(0)).square().sum(-1).mean().sqrt().clamp_min(1e-6)
+        anchors=xyz[torch.linspace(0,305,self.spatial_prior.shape[0]).long()]
+        self.spatial_prior.copy_(-torch.cdist(anchors,xyz).square()/(2*(.4*scale)**2))
+
+    def forward(self,x):
+        if x.shape[1:]!=(306,250):raise ValueError('Expected 306 x 250')
+        x=torch.einsum('wc,bct->bwt',(self.spatial_prior+self.delta).softmax(-1),x)
+        x=self.encoder(x)
+        attended=(self.attention(x).softmax(-1)*x).sum(-1)
+        bins=torch.cat([p.mean(-1) for p in torch.tensor_split(x,4,dim=-1)],dim=-1)
+        return self.head(torch.cat([attended,bins],dim=1))
+
+
 class WideResidualCNN(nn.Module):
     """Wider baseline-like sensor/temporal CNN retaining onset-relative latency.
 

@@ -1,5 +1,10 @@
 # pnpl-decoder
 
+**Latest Kaggle sweep:** import [kaggle_spatial_next.ipynb](kaggle_spatial_next.ipynb)
+and follow [SPATIAL_NEXT_PLAN.md](SPATIAL_NEXT_PLAN.md). It stages prediction
+analysis, spatial seeds/balancing, normalization/dropout, data expansion,
+multi-scale and geometry candidates, then local ensembles. Submission is opt-in.
+
 **Start here for new experiments:** [RESEARCH_PLAN.md](RESEARCH_PLAN.md).
 The current emphasis is domain generalization and controlled experiments, not
 larger models selected on narrative-only validation. `study.py` creates configs,

@@ -1,0 +1,132 @@
+{
+  "model": "temporal_spatial_cnn",
+  "seed": 2026,
+  "tasks": {
+    "Sherlock1": 10,
+    "Sherlock2": 12,
+    "TheMoth": 12,
+    "TIMIT": 4
+  },
+  "val_fraction": 0.2,
+  "validation_groups": [
+    [
+      "Sherlock1",
+      "0",
+      "9"
+    ],
+    [
+      "Sherlock1",
+      "0",
+      "10"
+    ],
+    [
+      "TheMoth",
+      "0",
+      "4"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "1"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "2"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "3"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "4"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "5"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "6"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "7"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "8"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "9"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "10"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "11"
+    ],
+    [
+      "Sherlock2",
+      "0",
+      "12"
+    ],
+    [
+      "TIMIT",
+      "0",
+      "4"
+    ]
+  ],
+  "width": 128,
+  "dropout": 0.3,
+  "cnn_dilations": [
+    1,
+    2,
+    4,
+    8,
+    1,
+    2
+  ],
+  "pooling_bins": 8,
+  "epochs": 24,
+  "batch_size": 128,
+  "learning_rate": 0.001,
+  "weight_decay": 0.01,
+  "patience": 6,
+  "threads": 4,
+  "revisions": {
+    "pnpl/LibriBrain": "5a7c332b34fc7be329c4df3e527a41f67bfd878f",
+    "pnpl/LibriBrain2": "78443d024480c66bf340073c69bef50af8d1d335",
+    "pnpl/LibriBrain-Competition-2026": "f72817721fb8d36a39840170d8ac644118fe45cc"
+  },
+  "save_epochs": [
+    3,
+    5,
+    8,
+    13
+  ],
+  "training_seed": 2026,
+  "normalization": "window_zscore",
+  "sampling": "natural",
+  "loss_weight_power": 0.5,
+  "evaluate_training": true,
+  "purge_repeated_sentences": true,
+  "temporal_banks": 32,
+  "spatial_depth": 2,
+  "num_workers": 2,
+  "prefetch_factor": 2,
+  "amp": true
+}
