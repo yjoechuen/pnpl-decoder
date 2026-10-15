@@ -42,7 +42,9 @@ your edits. Completion requires an atomic `completed.json` marker plus all repor
 saved config and data fingerprints are checked before skipping. Interrupted runs
 resume from `latest.pt`; only `best.pt` remaining uses the documented weights-only
 warm start (history must also be restored). Use a new root for reruns/config
-changes. No auto-upload or final-test evaluation. Default is **one GPU**.
+changes. No auto-upload or final-test evaluation. Training defaults to **two GPUs**;
+select T4 x2. The trainer rejects requests for unavailable GPUs rather than silently
+falling back. Ensemble evaluation/inference still uses one GPU.
 
 ## Step 1 — diagnose existing predictions
 

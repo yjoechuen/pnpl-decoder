@@ -37,7 +37,7 @@ def export_geometry(raw_fif,training_h5,output):
 
 class NextStage:
     """Fresh-process staged Kaggle training. Completed runs are never overwritten."""
-    def __init__(self,repo='/kaggle/working/pnpl-decoder',root='/kaggle/working/spatial-next',devices=1):
+    def __init__(self,repo='/kaggle/working/pnpl-decoder',root='/kaggle/working/spatial-next',devices=2):
         self.repo,self.root=Path(repo),Path(root)
         self.devices=devices
         generate(self.repo)

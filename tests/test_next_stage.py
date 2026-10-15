@@ -7,6 +7,13 @@ from decoder import build_model,config,make_loader,seed_everything,select_traini
 from next_stage import generate,compare
 
 
+def test_stage_defaults_to_two_gpus(tmp_path,monkeypatch):
+    import next_stage
+    monkeypatch.setattr(next_stage,'generate',lambda repo:None)
+    stage=next_stage.NextStage(repo=tmp_path,root=tmp_path/'runs')
+    assert stage.devices==2
+
+
 @pytest.mark.parametrize('name',['multiscale_spatial_cnn','geometry_cnn'])
 def test_candidate_backward(name):
     seed_everything(1,threads=2)
